@@ -3,34 +3,34 @@ import torch
 import torch.nn.functional as F
 
 def gradient_penalty(D, real, fake, device):
-    alpha = torch.rand(real.size(0), 1, 1, 1, device=device)
-    interp = (alpha * real.unsqueeze(1) + (1 - alpha) * fake.unsqueeze(1)).requires_grad_(True)
-    # D expects [B, n_mels, T] wants unsqueeze inside
-    interp = interp.squeeze(1)
+    # real/fake: [B, n_mels, T]
+    alpha = torch.rand(real.size(0), 1, 1, device=device)
+    interp = (alpha * real + (1 - alpha) * fake).requires_grad_(True)
     out = D(interp)
-    grad = torch.autograd.grad(outputs=out, inputs=interp, grad_outputs=torch.ones_like(out).to(device),
+    grad = torch.autograd.grad(out, interp, grad_outputs=torch.ones_like(out),
                                create_graph=True, retain_graph=True, only_inputs=True)[0]
     grad = grad.view(grad.size(0), -1)
-    gp = ((grad.norm(2, dim=1) - 1) ** 2).mean()
-    return gp
+    return ((grad.norm(2, dim=1) - 1)**2).mean()
 
 def wgan_d_loss(real_scores, fake_scores):
-    return torch.mean(fake_scores) - torch.mean(real_scores)
+    return fake_scores.mean() - real_scores.mean()
 
 def wgan_g_loss(fake_scores):
-    return -torch.mean(fake_scores)
+    return -fake_scores.mean()
 
-# evasion loss: if detector outputs a scalar score (higher = spoof prob),
-# we want to minimize probability of detector flagging as spoof.
-# assume detector(wave) -> prob_spoof in [0,1] (if logits, adjust)
-def evasion_loss_from_detector(detector_scores, target_label=0.0):
-    # simplest: L2 to target_label (0 bona fide)
-    return F.mse_loss(detector_scores, detector_scores.new_full(detector_scores.shape, target_label))
+def evasion_loss_ensemble(score_list, target=0.0, reduce="mean"):
+    if not score_list: 
+        return torch.tensor(0.0, device="cuda" if torch.cuda.is_available() else "cpu")
+    losses = []
+    for s in score_list:
+        if s.dim() > 1: s = s.squeeze()
+        losses.append(F.mse_loss(s, s.new_full(s.shape, float(target))))
+    if reduce == "sum": return torch.stack(losses).sum()
+    return torch.stack(losses).mean()
 
-# spectral L1 loss on mel
-def spec_loss(gen_mel, ref_mel):
+def spec_l1(gen_mel, ref_mel):
     return F.l1_loss(gen_mel, ref_mel)
 
-# speaker loss: requires speaker embedding model
-def speaker_loss_fn(emb_gen, emb_ref):
+# speaker loss = MSE între embeddings
+def speaker_loss(emb_gen, emb_ref):
     return F.mse_loss(emb_gen, emb_ref)

@@ -1,60 +1,85 @@
 # utils.py
-import torch
-import torchaudio
-import numpy as np
-import soundfile as sf
-
-SR = 16000
-N_FFT = 1024
-HOP_LENGTH = 256
-WIN_LENGTH = 1024
-N_MELS = 80
-
-mel_to_spec_inv = torchaudio.transforms.GriffinLim(
-    n_fft=N_FFT, hop_length=HOP_LENGTH, win_length=WIN_LENGTH, n_iter=32
-)
-
-def mel_to_wave(mel_log):
-    # mel_log is log1p(mel) in dataset; we invert: mel = exp(mel_log) - 1
-    mel = torch.expm1(mel_log)
-    # Need to convert mel spectrogram back to linear STFT magnitude:
-    # torchaudio doesn't have inverse mel matrix by default; construct via librosa / pseudo-inverse
-    import librosa
-    mel_np = mel.detach().cpu().numpy()
-    # mel_np shape [B, n_mels, T]
-    waves = []
-    inv_mel = librosa.filters.mel(sr=SR, n_fft=N_FFT, n_mels=N_MELS)
-    inv_mel = np.linalg.pinv(inv_mel)
-    for m in mel_np:
-        S = np.maximum(1e-8, inv_mel @ m)  # linear mag
-        # Griffin-Lim expects magnitude stft shape [freq_bins, time]
-        # but torchaudio's GriffinLim works on stft complex? We'll use librosa griffinlim for simplicity:
-        wav = librosa.griffinlim(S, hop_length=HOP_LENGTH, win_length=WIN_LENGTH, n_iter=32)
-        waves.append(wav)
-    # return tensor [B, L]
-    max_len = max([len(w) for w in waves])
-    out = np.zeros((len(waves), max_len), dtype=np.float32)
-    for i,w in enumerate(waves): out[i,:len(w)] = w
-    return torch.from_numpy(out)
+import torch, torchaudio, numpy as np, soundfile as sf
+from pathlib import Path
+from typing import List
+from constants import SR, N_FFT, HOP_LENGTH, WIN_LENGTH
 
 def save_wav(path, wav, sr=SR):
-    # wav: numpy or torch 1D
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     if isinstance(wav, torch.Tensor):
         wav = wav.detach().cpu().numpy()
-    sf.write(path, wav, sr)
+    sf.write(str(path), wav, sr)
 
-def load_detector(model_path, device):
+# -------- HiFi-GAN TorchScript (rapid și simplu) --------
+class HiFiGANVocoder:
     """
-    Expected: detector is a PyTorch model saved with torch.save(model.state_dict()) OR the whole model.
-    The detector must provide a function: detector(waveform_tensor) -> score tensor [B]
-    Here we try to load model and provide wrapper. If your detector code is custom, replace loader.
+    Așteaptă un .pt (TorchScript) care primește mel [B, n_mels, T] (log-mel sau mel?),
+    și returnează waveform [B, L]. Folosim mel 'lin' (nu log1p). Vom face expm1 înainte.
     """
-    import torch
-    try:
-        model = torch.load(model_path, map_location=device)
-        model.to(device)
-        model.eval()
-        return model
-    except Exception as e:
-        print("Failed to auto-load detector. Please provide a wrapper that loads & returns detector model.")
-        raise e
+    def __init__(self, jit_path: Path, device):
+        self.device = device
+        self.ok = False
+        if jit_path is None or not Path(jit_path).exists():
+            print("[HiFi-GAN] TorchScript file not found, falling back to Griffin-Lim.")
+            return
+        self.model = torch.jit.load(str(jit_path), map_location=device)
+        self.model.eval()
+        self.ok = True
+
+    @torch.inference_mode()
+    def __call__(self, mel_log: torch.Tensor) -> torch.Tensor:
+        # mel_log e log1p(mel); invertim
+        mel = torch.expm1(mel_log).to(self.device)  # [B, n_mels, T]
+        if self.ok:
+            wav = self.model(mel)  # [B, L]
+            return wav
+        # fallback: Griffin-Lim (mai lent)
+        import librosa
+        mel_np = mel.detach().cpu().numpy()
+        inv_mel = librosa.filters.mel(sr=SR, n_fft=N_FFT, n_mels=mel_np.shape[1])
+        inv_mel = np.linalg.pinv(inv_mel)
+        waves = []
+        for m in mel_np:
+            S = np.maximum(1e-8, inv_mel @ m)
+            w = librosa.griffinlim(S, hop_length=HOP_LENGTH, win_length=WIN_LENGTH, n_iter=32)
+            waves.append(w.astype(np.float32))
+        maxL = max(map(len, waves))
+        out = np.zeros((len(waves), maxL), dtype=np.float32)
+        for i,w in enumerate(waves): out[i,:len(w)] = w
+        return torch.from_numpy(out)
+
+# -------- DETECTORS (ensemble) --------
+def load_detectors(paths: List[Path], device):
+    """
+    Fiecare model trebuie să accepte waveform [B, L] SAU mel [B, n_mels, T]
+    și să returneze scor scalar per item (spoof prob / logit).
+    """
+    detectors = []
+    for p in paths:
+        p = Path(p)
+        if not p.exists(): 
+            print(f"[detector] WARNING: not found: {p}")
+            continue
+        m = torch.load(str(p), map_location=device)
+        m.to(device).eval()
+        detectors.append(m)
+    if not detectors:
+        print("[detector] No detectors found! Evasion loss will be zero.")
+    return detectors
+
+@torch.inference_mode()
+def run_ensemble_detectors(detectors, wave=None, mel=None):
+    """
+    Rulează toate detectoarele disponibile; întoarce listă de scoruri tensor [B].
+    Încearcă întâi cu wave, dacă dă eroare încearcă cu mel.
+    """
+    scores = []
+    for det in detectors:
+        try:
+            s = det(wave) if wave is not None else det(mel)
+        except Exception:
+            s = det(mel) if mel is not None else det(wave)
+        if s.dim() > 1: s = s.squeeze()
+        scores.append(s)
+    return scores

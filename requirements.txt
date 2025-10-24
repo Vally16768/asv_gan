@@ -1,0 +1,9 @@
+torch
+torchaudio
+librosa
+soundfile
+tqdm
+numpy
+pandas
+scikit-learn
+speechbrain    # doar dacă USE_SPEAKER_LOSS=True

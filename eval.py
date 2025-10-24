@@ -1,83 +1,75 @@
 # eval.py
-import argparse
-import torch
-from dataset import BonaFideDataset
-from models import UNetMel
-from utils import mel_to_wave, load_detector, save_wav
-from sklearn.metrics import roc_curve
-import numpy as np
-import os
+import os, argparse, torch, pandas as pd, numpy as np
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from sklearn.metrics import roc_curve
+
+from dataset import BonaFideDataset
+from models import UNetMel
+from utils import HiFiGANVocoder, load_detectors, run_ensemble_detectors, save_wav
+from constants import (CHECKPOINT_DIR, EVAL_OUT, HIFIGAN_JIT, DETECTOR_PATHS, SR, MAX_SEC, N_MELS)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def compute_eer(labels, scores):
-    # labels: 0 bona-fide, 1 spoof. But here we have only bona-fide; for attack eval we treat detector score high=spoof
-    fpr, tpr, thresholds = roc_curve(labels, scores, pos_label=1)
+    fpr, tpr, thr = roc_curve(labels, scores, pos_label=1)
     fnr = 1 - tpr
-    # find threshold where fpr ~= fnr
     idx = np.nanargmin(np.abs(fpr - fnr))
-    eer = (fpr[idx] + fnr[idx]) / 2.0
-    return eer, thresholds[idx]
+    return float((fpr[idx] + fnr[idx]) / 2.0), float(thr[idx])
 
-def eval(args):
+def eval_model(args):
+    os.makedirs(EVAL_OUT, exist_ok=True)
     ds = BonaFideDataset(args.bona_fide_dir, max_sec=args.max_sec)
     dl = DataLoader(ds, batch_size=1, shuffle=False)
 
-    G = UNetMel(n_mels=80).to(DEVICE)
+    G = UNetMel(n_mels=N_MELS).to(DEVICE)
     G.load_state_dict(torch.load(args.generator_ckpt, map_location=DEVICE))
     G.eval()
 
-    detector = load_detector(args.detector_path, DEVICE)
+    vocoder = HiFiGANVocoder(HIFIGAN_JIT, DEVICE)
+    detectors = load_detectors(DETECTOR_PATHS, DEVICE)
 
-    detector_scores_clean = []
-    detector_scores_adv = []
-    for batch in tqdm(dl):
+    rows = []
+    for batch in tqdm(dl, desc="eval"):
         mel = batch["mel"].to(DEVICE)
         wave = batch["wave"].to(DEVICE)
-        with torch.no_grad():
-            delta = G(mel)
-            gen_mel = mel + delta
-            # reconstruct waves
-            gen_wave = mel_to_wave(gen_mel.cpu())[0].to(DEVICE)
-            # detector may expect wave or mel
-            try:
-                score_clean = detector(wave.unsqueeze(0))
-                score_adv = detector(gen_wave.unsqueeze(0))
-            except Exception:
-                score_clean = detector(mel)
-                score_adv = detector(gen_mel)
-            # ensure scalars
-            if score_clean.dim() > 0: score_clean = score_clean.squeeze().cpu().item()
-            else: score_clean = float(score_clean)
-            if score_adv.dim() > 0: score_adv = score_adv.squeeze().cpu().item()
-            else: score_adv = float(score_adv)
-            detector_scores_clean.append(score_clean)
-            detector_scores_adv.append(score_adv)
+        path = batch["path"][0]
 
-    # For EER calculation we need labels for positive(=spoof) and negative(=bona). Here we test how detector scores change:
-    # Simplest view: compute how many adv scores go below a detection threshold (like median/operating point).
-    # For demonstration compute mean scores and report relative drop.
-    import numpy as np
-    print("clean mean score:", np.mean(detector_scores_clean))
-    print("adv mean score:", np.mean(detector_scores_adv))
-    # save per-utt csv
-    import pandas as pd
-    df = pd.DataFrame({
-        "path": [b["path"][0] for b in dl.dataset],  # careful: dataset order
-        "score_clean": detector_scores_clean,
-        "score_adv": detector_scores_adv
-    })
-    os.makedirs(args.out_dir, exist_ok=True)
-    df.to_csv(os.path.join(args.out_dir, "detector_scores.csv"), index=False)
+        with torch.inference_mode():
+            delta = G(mel)
+            mel_fake = mel + delta
+            wav_fake = vocoder(mel_fake)
+
+        scores = run_ensemble_detectors(detectors, wave=wav_fake, mel=mel_fake)
+        # agregăm prin medie
+        if scores:
+            s = torch.stack([x.squeeze() for x in scores], dim=0).mean().item()
+        else:
+            s = float("nan")
+
+        rows.append({"path": path, "score_adv": s})
+
+    df = pd.DataFrame(rows)
+    out_csv = os.path.join(EVAL_OUT, "detector_scores.csv")
+    df.to_csv(out_csv, index=False)
+    print(f"[eval] Wrote {out_csv}")
+
+    # Dacă dai și label-uri (prin --protocol_csv: două coloane path,label[0/1]),
+    # calculăm EER.
+    if args.protocol_csv and os.path.exists(args.protocol_csv):
+        proto = pd.read_csv(args.protocol_csv)
+        merged = df.merge(proto, on="path", how="inner")
+        labels = merged["label"].to_numpy().astype(int)
+        scores = merged["score_adv"].to_numpy().astype(float)
+        valid = np.isfinite(scores)
+        eer, thr = compute_eer(labels[valid], scores[valid])
+        print(f"[eval] EER={eer:.4f} @ thr={thr:.4f}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--bona_fide_dir", required=True)
-    parser.add_argument("--generator_ckpt", required=True)
-    parser.add_argument("--detector_path", required=True)
-    parser.add_argument("--out_dir", default="eval_out")
-    parser.add_argument("--max_sec", type=float, default=6.0)
-    args = parser.parse_args()
-    eval(args)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--bona_fide_dir", required=True)
+    ap.add_argument("--generator_ckpt", required=True)
+    ap.add_argument("--protocol_csv", default=None, help="CSV cu coloane: path,label(0 bona,1 spoof)")
+    ap.add_argument("--max_sec", type=float, default=MAX_SEC)
+    args = ap.parse_args()
+    eval_model(args)
