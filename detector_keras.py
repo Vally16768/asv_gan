@@ -1,113 +1,62 @@
-import os
-import tempfile
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
+# detector_keras.py
+from __future__ import annotations
 import numpy as np
-import soundfile as sf
-import tensorflow as tf
+import torch
 
-from asvspoof.config import ExtractConfig
-from features import extract_features_for_path  # folosește pipeline-ul tău
+from constants import TARGET_SR
 
-try:
-    import joblib
-except Exception:
-    joblib = None
-
-
-def _read_feature_order(order_path: Path) -> Optional[List[str]]:
-    if order_path.exists():
-        with order_path.open("r", encoding="utf-8") as f:
-            return [ln.strip() for ln in f if ln.strip()]
-    return None
-
-
-class KerasASVDetector:
+class KerasDetector:
     """
-    Keras/TensorFlow wrapper:
-      - extrage feature-uri cu extract_features_for_path()
-      - aplică ordinea din ASVmodel/feature_order.txt (dacă există)
-      - aplică scaler.pkl (StandardScaler) dacă există
+    Încarcă un model Keras (.keras/.h5) și calculează scoruri pe features
+    în ORDINEA: MFCC + Chroma + Spectral Contrast + Temporal + Pitch + Wavelets.
     """
-
-    def __init__(
-        self,
-        model_path: str,
-        cfg: Optional[ExtractConfig] = None,
-        device: str = "cpu",
-        feature_order: Optional[List[str]] = None,
-    ):
-        self.model_path = str(model_path)
+    def __init__(self, model_path: str, device: str = "cpu", cfg: object | None = None):
+        import tensorflow as tf  # asigură-te că ai TF >= 2.17.x pe Py3.12
+        from tensorflow import keras
+        self.model = keras.models.load_model(model_path, compile=False)
         self.device = device
-        self.cfg = cfg or ExtractConfig()
+        self.sr = getattr(cfg, "sample_rate", TARGET_SR) if cfg else TARGET_SR
 
-        # TF mem growth (nu ocupă tot GPU)
-        try:
-            gpus = tf.config.experimental.list_physical_devices("GPU")
-            if gpus:
-                for gpu in gpus:
-                    tf.config.experimental.set_memory_growth(gpu, True)
-        except Exception:
-            pass
+        # API din features.py (patch-ul de mai sus)
+        from features import batch_from_waves, ExtractConfig
+        self._batch_from_waves = batch_from_waves
+        self._cfg = ExtractConfig()  # sau folosește cfg dacă vrei să-l transmiți
 
-        self.model = tf.keras.models.load_model(self.model_path, compile=False)
+        # Aflăm dimensiunea de intrare a modelului (F așteptat)
+        ishape = getattr(self.model, "input_shape", None)
+        self._F_expected = None
+        if ishape is not None:
+            # compat cu (None, F) sau (None, F1, F2) - păstrăm F total dacă e 2D
+            if isinstance(ishape, (list, tuple)) and len(ishape) >= 2:
+                if isinstance(ishape[1], (list, tuple)):
+                    self._F_expected = int(np.prod(ishape[1]))
+                else:
+                    self._F_expected = int(ishape[1])
 
-        # Ordinea coloanelor (prioritar: fișier manifest)
-        order_from_file = _read_feature_order(Path(self.model_path).with_name("feature_order.txt"))
-        self.feature_order = feature_order or order_from_file  # poate fi None -> fallback la sortare
+    def _prep_from_wave(self, wave: torch.Tensor) -> np.ndarray:
+        """
+        wave: [B, 1, T] sau [B, T]
+        -> X: [B, F] compatibil cu modelul; pad/trunchiere dacă e necesar.
+        """
+        if wave.dim() == 3 and wave.size(1) == 1:
+            wave = wave.squeeze(1)
+        waves = wave.detach().cpu().numpy().astype(np.float32, copy=False)
 
-        # Scaler opțional
-        self.scaler = None
-        scaler_path = Path(self.model_path).with_name("scaler.pkl")
-        if joblib and scaler_path.exists():
-            try:
-                self.scaler = joblib.load(scaler_path)
-                print(f"[detector] Loaded scaler: {scaler_path}")
-            except Exception as e:
-                print(f"[detector] Could not load scaler: {e}")
+        X = self._batch_from_waves([w for w in waves], sr=self.sr, cfg=self._cfg)  # [B, F_dyn]
+        F_dyn = X.shape[1]
+        if self._F_expected is not None and self._F_expected != F_dyn:
+            # potrivim dimensiunea prin pad sau truncate (robust pentru evasion loss)
+            F = self._F_expected
+            if F_dyn < F:
+                X = np.pad(X, ((0,0),(0, F - F_dyn)), mode="constant", constant_values=0.0)
+            elif F_dyn > F:
+                X = X[:, :F]
+        return X.astype(np.float32, copy=False)
 
-        self._cached_keys: Optional[List[str]] = None
-
-    def _featurize_tmp_wav(self, wav_np: np.ndarray, sr: int) -> Dict[str, Any]:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tfh:
-            tmp = tfh.name
-        try:
-            sf.write(tmp, wav_np.astype(np.float32), sr)
-            feats = extract_features_for_path(Path(tmp), self.cfg)
-        finally:
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
-        return feats
-
-    def _vectorize(self, feats: Dict[str, Any]) -> Tuple[np.ndarray, List[str]]:
-        # decide order
-        keys: List[str]
-        if self.feature_order is not None:
-            keys = self.feature_order
-            missing = [k for k in keys if k not in feats]
-            if missing:
-                raise KeyError(f"Missing features required by model: {missing[:10]} ...")
-            vec = np.array([float(feats[k]) for k in keys], dtype=np.float32)
-        else:
-            # fallback: ordonare alfabetică deterministă
-            keys = sorted(k for k in feats.keys() if k not in {"split", "file_id", "path", "label", "target"})
-            vec = np.array([float(feats[k]) for k in keys], dtype=np.float32)
-
-        if self.scaler is not None:
-            vec = self.scaler.transform(vec[None, :])[0].astype(np.float32)
-
-        return vec, keys
-
-    def score_wave(self, wav_np: np.ndarray, sr: int = 16000) -> float:
-        feats = self._featurize_tmp_wav(wav_np, sr)
-        vec, keys = self._vectorize(feats)
-        if self._cached_keys is None:
-            self._cached_keys = keys
-        pred = self.model.predict(vec[None, :], verbose=0)
-        return float(np.squeeze(pred))
-
-    def get_feature_keys(self) -> Optional[List[str]]:
-        return self._cached_keys
+    def __call__(self, wave: torch.Tensor = None, mel: torch.Tensor = None) -> torch.Tensor:
+        if wave is None:
+            raise RuntimeError("KerasDetector necesită 'wave' pentru extragere de features.")
+        X = self._prep_from_wave(wave)               # [B, F]
+        y = self.model.predict(X, verbose=0)         # [B, 1] sau [B]
+        y = np.squeeze(y).astype(np.float32)
+        return torch.from_numpy(y)

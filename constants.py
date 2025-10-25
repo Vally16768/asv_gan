@@ -40,5 +40,5 @@ LOG_DIR: str = "logs"
 # Dacă ai un HiFi-GAN jit, pune-l aici. Dacă nu există, training-ul continuă fără vocoder.
 HIFIGAN_JIT: str = str(Path("pretrained/hifigan.jit").resolve())
 # Listează aici detectoarele pentru evasion loss (ex: modelul Keras)
-DETECTOR_PATHS: list[str] = [str(Path("ASVmodel/best_model.keras").resolve())]
+DETECTOR_PATHS: list[str] = [str(Path("ASVmodel/best_model.h5").resolve())]
 USE_SPEAKER_LOSS: bool = False  # setează True dacă vrei speaker loss cu speechbrain
