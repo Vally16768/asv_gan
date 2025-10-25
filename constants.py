@@ -2,51 +2,42 @@
 from __future__ import annotations
 from pathlib import Path
 
-# -------- Audio / Features --------
-TARGET_SR: int = 16000
-N_FFT: int = 1024
-WIN_LENGTH: int = 400       # 25 ms @16k
-HOP_LENGTH: int = 160       # 10 ms @16k
-N_MELS: int = 64
-N_MFCC: int = 128
-MAX_SEC: float = 2.0        # crop/pad la ~4s
+# ----------------- Audio / Features -----------------
+SR = 16000
+TARGET_SR = SR
 
-# Ordinea convenită a feature-urilor pentru detectorul ASV Keras
-FEATURE_ORDER = [
-    "mfcc",
-    "chroma",
-    "spectral_contrast",
-    "temporal",
-    "pitch",
-    "wavelets",
-]
+N_MELS = 128
+N_FFT = 1024
+HOP_LENGTH = 160      # 10 ms @ 16k
+WIN_LENGTH = 400      # 25 ms @ 16k
 
-# -------- Training defaults --------
-EPOCHS: int = 3
-BATCH_SIZE: int = 8
-LR: float = 2e-4
-CRITIC_ITERS: int = 5
-GP_LAMBDA: float = 10.0
-LAMBDA_GAN: float = 1.0
-LAMBDA_SPEC: float = 10.0
-LAMBDA_EVASION: float = 1.0
-LAMBDA_SPK: float = 0.5              # pierdere de consistență speaker (opțional)
+# Normalizare features (poți ajusta după o trecere pe date)
+FEATS_MEAN = 0.0
+FEATS_STD  = 1.0
 
-# -------- I/O --------
-CHECKPOINT_DIR: str = "checkpoints"
-LOG_DIR: str = "logs"
+# ----------------- Căi -----------------
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "database" / "data"
 
-# -------- Vocoder / Detector --------
-# Dacă ai un HiFi-GAN jit, pune-l aici. Dacă nu există, training-ul continuă fără vocoder.
-HIFIGAN_JIT: str = str(Path("pretrained/hifigan.jit").resolve())
-# Listează aici detectoarele pentru evasion loss (ex: modelul Keras)
-SR: int = TARGET_SR                 # alias used by eval.py / wrappers
-EVAL_OUT: str = "eval_out"          # folder for evaluation CSVs
+# ----------------- Antrenare -----------------
+AMP_ENABLED = True
+BATCH_SIZE = 32
+EPOCHS = 3
+CRITIC_ITERS = 5
 
-# (optional but helpful) accept either .keras or .h5 model files
-from pathlib import Path
-DETECTOR_PATHS: list[str] = [
-    str(Path("ASVmodel/best_model.keras").resolve()),
-    str(Path("ASVmodel/best_model.h5").resolve()),
-]
-USE_SPEAKER_LOSS: bool = False  # setează True dacă vrei speaker loss cu speechbrain
+# TTUR
+LR_G = 2e-4
+LR_D = 4e-4
+BETA1 = 0.0
+BETA2 = 0.99
+
+# Ponderi pierderi (mai conservator pentru stabilitate inițială)
+LAMBDA_GAN = 1.0
+LAMBDA_SPEC = 1.0        # redus de la 10.0
+LAMBDA_R1 = 5.0          # redus de la 10.0
+
+# ----------------- Logging -----------------
+LOG_INTERVAL = 50
+VAL_INTERVAL = 1
+SAVE_DIR = ROOT / "checkpoints"
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
