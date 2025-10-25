@@ -1,6 +1,5 @@
-# detector_wrapper.py (fixed)
+# detector_wrapper.py — device-aware Mel everywhere
 from typing import Union
-
 import torch
 import torchaudio
 
@@ -15,19 +14,27 @@ _mel_transform = torchaudio.transforms.MelSpectrogram(
     power=1.0,
 )
 
+def wave_to_mel(wave: torch.Tensor) -> torch.Tensor:
+    # acceptă [T], [1,T], [B,1,T], [B,T]
+    if wave.dim() == 1:
+        wave = wave.unsqueeze(0)
+    if wave.dim() == 3 and wave.size(1) == 1:
+        wave = wave.squeeze(1)
+    mel = _mel_transform.to(wave.device)(wave)  # <<< fix device
+    mel = torch.log1p(torch.clamp(mel, min=0.0))
+    return mel
+
 class DetectorWrapper(torch.nn.Module):
     """
     Wrapper generic pentru detectoare PyTorch (nn.Module or TorchScript).
-    It accepts either:
-      - model: a torch.nn.Module / ScriptModule that takes mel or waveform and returns scores
-      - model: None -> returns zeros
-    For Keras detection we keep separate KerasDetector wrapper (in detector_keras.py).
+    Acceptă:
+      - model: torch.nn.Module / ScriptModule ce primește mel sau waveform și returnează scoruri
+      - model: None -> returnează zeros
     """
     def __init__(self, model: torch.nn.Module | None = None):
         super().__init__()
         self.model = model
         if self.model is not None:
-            # if it's a nn.Module, ensure eval
             try:
                 self.model.eval()
             except Exception:
@@ -39,20 +46,20 @@ class DetectorWrapper(torch.nn.Module):
             wave = wave.unsqueeze(0)
         if wave.dim() == 3 and wave.size(1) == 1:
             wave = wave.squeeze(1)
-        mel = _mel_transform(wave)
-        mel = torch.log1p(mel)
+        mel = _mel_transform.to(wave.device)(wave)  # <<< fix device
+        mel = torch.log1p(torch.clamp(mel, min=0.0))
         return mel
 
     def forward(self, x: Union[torch.Tensor, list]) -> torch.Tensor:
         """
-        Accept either waveform tensors [B,1,T] or mel [B, M, T] or raw waveform vector [T] / [B, T].
-        If self.model is None -> returns zero scores.
+        Acceptă waveform [B,1,T] sau mel [B,M,T] ori [T]/[B,T].
+        Dacă self.model este None -> întoarce zero-uri.
         """
         if torch.is_tensor(x):
             if x.dim() == 3 and x.size(1) == N_MELS:
                 mel = x
             elif x.dim() == 2:
-                # [B, T] waveform -> transform to mel
+                # [B,T] posibil waveform -> fă mel
                 if x.size(1) > 1000:
                     mel = self.wave_to_mel(x)
                 else:
@@ -67,14 +74,13 @@ class DetectorWrapper(torch.nn.Module):
         if self.model is None:
             return torch.zeros(mel.size(0), device=mel.device)
 
-        # If model is nn.Module or ScriptModule that expects mel, call directly
         try:
             out = self.model(mel)
             return out.squeeze()
         except Exception as e:
-            # Try feeding waveform instead
+            # fallback: poate modelul așteaptă waveform [B,1,T]
             try:
-                wav_like = x if x.dim() == 3 and x.size(1) == 1 else None
+                wav_like = x if (torch.is_tensor(x) and x.dim() == 3 and x.size(1) == 1) else None
                 if wav_like is not None:
                     out = self.model(wav_like)
                     return out.squeeze()

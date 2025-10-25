@@ -16,19 +16,21 @@ _mel = torchaudio.transforms.MelSpectrogram(
     hop_length=HOP_LENGTH,
     win_length=WIN_LENGTH,
     n_mels=N_MELS,
-    power=1.0,      # 1.0 (magnitude) e mai stabil decât 2.0 la log1p
+    power=1.0,      # 1.0 (magnitude) + log1p => mai stabil
 )
 
 def _safe(x: torch.Tensor) -> torch.Tensor:
-    # înlocuiește NaN/Inf cu 0, apoi decupează
     x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     return x.clamp(_CLIP_MIN, _CLIP_MAX)
 
 def _logmel(wave: torch.Tensor) -> torch.Tensor:
+    """
+    wave: [B,1,T] / [B,T] -> logmel [B,M,Tf], device-aware
+    """
     if wave.dim() == 3 and wave.size(1) == 1:
         wave = wave.squeeze(1)
-    mel = _mel(wave)                # [B,M,Tm] >= 0
-    mel = torch.log1p(mel)          # stabil numeric
+    mel = _mel.to(wave.device)(wave)        # <<< fix device
+    mel = torch.log1p(torch.clamp(mel, min=0.0))
     return _safe(mel)
 
 def _mfcc_from_logmel(logmel: torch.Tensor, n_mfcc: int = 20) -> torch.Tensor:
@@ -41,8 +43,8 @@ def _mfcc_from_logmel(logmel: torch.Tensor, n_mfcc: int = 20) -> torch.Tensor:
     dct = scale * torch.cos((math.pi / M) * (m + 0.5) * k)
     dct[0] = dct[0] / math.sqrt(2.0)
 
-    x = logmel.transpose(1, 2)            # [B,T,M]
-    mfcc = x @ dct.t()                    # [B,T,M]
+    x = logmel.transpose(1, 2)                  # [B,T,M]
+    mfcc = x @ dct.t()                          # [B,T,M]
     mfcc = mfcc[:, :, :n_mfcc].transpose(1, 2)  # [B,n_mfcc,T]
     return _safe(mfcc)
 
@@ -63,84 +65,27 @@ def _spectral_contrast(logmel: torch.Tensor, n_bands: int = 6) -> torch.Tensor:
     out = torch.cat(bands, dim=1)
     return _safe(out)
 
-# add at top if not already imported
-from constants import HOP_LENGTH
-
 def _pitch_proxy(wave: torch.Tensor, target_len: int) -> torch.Tensor:
     """
-    Returnează un canal de "pitch-like" la rezoluția cadrelor Mel: [B,1,target_len].
-    Calculează autocorelații simple pe semnalul în eșantioane, apoi reduce la cadre prin
-    average-pool cu stride=HOP_LENGTH și ajustează la exact target_len.
+    Un canal „pitch-like” la rezoluția cadrelor Mel: [B,1,target_len].
+    Aproximăm prin autocorelație simplă + average-pool pe eșantioane (stride=HOP_LENGTH),
+    apoi interpolăm exact la target_len.
     """
     if wave.dim() == 2:
         wave = wave.unsqueeze(1)   # [B,1,T_samples]
     B, _, T_s = wave.shape
-
-    # Autocorelatii pe câteva lag-uri (proxy pt. pitch); toate la rezoluție de eșantion.
-    lags = [int(0.003*SR), int(0.006*SR), int(0.01*SR), int(0.02*SR)]
-    outs = []
-    for lag in lags:
-        if T_s <= lag:
-            corr = torch.zeros(B, 1, 1, device=wave.device, dtype=wave.dtype)
-        else:
-            a = wave[:, :, :-lag]
-            b = wave[:, :, lag:]
-            corr = (a * b).mean(dim=2, keepdim=True)   # [B,1,1]
-        outs.append(corr)
-    pitch_samp = torch.cat(outs, dim=2)               # [B,1,4]
-
-    # Extinde pe axa timp pentru a avea un semnal 1D ce putem pool-ui.
-    # Folosim nearest pentru a evita overshoot; oricum urmează pool.
-    pitch_samp = torch.nn.functional.interpolate(
-        pitch_samp, size=T_s, mode="nearest"
-    )                                                # [B,1,T_samples]
-
-    # Downsample la rezoluție de cadre (aprox T_s / HOP_LENGTH).
-    # Padding la dreapta pentru multiplu exact.
-    pad = (0, (HOP_LENGTH - (T_s % HOP_LENGTH)) % HOP_LENGTH)
-    pitch_padded = torch.nn.functional.pad(pitch_samp, pad)  # [B,1,T_pad]
-    pitch_frames = torch.nn.functional.avg_pool1d(
-        pitch_padded, kernel_size=HOP_LENGTH, stride=HOP_LENGTH
-    )                                                        # [B,1,~T_frames]
-
-    # Ajustează exact la target_len (mel frames)
-    pitch = torch.nn.functional.interpolate(
-        pitch_frames, size=target_len, mode="linear", align_corners=False
-    )                                                        # [B,1,target_len]
-
+    # autocorelație scurtă
+    max_lag = int(0.02 * SR)  # ~20ms
+    pad = (0, max_lag)
+    wpad = F.pad(wave, pad)
+    pitch_samp = (wpad[:, :, :-max_lag] * wpad[:, :, max_lag:]).mean(dim=1, keepdim=True)  # [B,1,T_samples]
+    # downsample la rezoluție de cadre
+    pad2 = (0, (HOP_LENGTH - (pitch_samp.shape[-1] % HOP_LENGTH)) % HOP_LENGTH)
+    pitch_padded = F.pad(pitch_samp, pad2)
+    pitch_frames = F.avg_pool1d(pitch_padded, kernel_size=HOP_LENGTH, stride=HOP_LENGTH)   # [B,1,~T]
+    # ajustează fix la target_len
+    pitch = F.interpolate(pitch_frames, size=target_len, mode="linear", align_corners=False)
     return _safe(pitch)
-
-def stack_asv_features(wave: torch.Tensor) -> torch.Tensor:
-    """
-    Ordine: MFCC + Chroma + Spectral Contrast + Temporal + Pitch + Wavelets
-    Returnează [B, C, T_frames]
-    """
-    logmel = _logmel(wave)                        # [B,M,Tf]
-    mfcc = _mfcc_from_logmel(logmel, n_mfcc=20)   # [B,20,Tf]
-
-    B, M, Tf = logmel.shape
-    groups = 12
-    gsize = max(1, M // groups)
-    chroma = []
-    for i in range(groups):
-        s = i * gsize
-        e = min(M, s + gsize)
-        chroma.append(logmel[:, s:e, :].mean(dim=1, keepdim=True))
-    chroma = torch.cat(chroma, dim=1)             # [B,12,Tf]
-    chroma = _safe(chroma)
-
-    spec_contrast = _spectral_contrast(logmel, n_bands=6)  # [B,6,Tf]
-    temporal = _temporal_stats(logmel)                     # [B,M+1,Tf]
-
-    # ⬇⬇ FIX: pitch la rezoluția cadrelor mel
-    pitch = _pitch_proxy(wave, target_len=Tf)              # [B,1,Tf]
-
-    wavelets = _wavelets_proxy(logmel)                     # [B,M*4,Tf]
-
-    feats = torch.cat([mfcc, chroma, spec_contrast, temporal, pitch, wavelets], dim=1)
-    feats = _safe(feats)
-    feats = (feats - float(FEATS_MEAN)) / (float(FEATS_STD) + 1e-8)
-    return feats
 
 def _wavelets_proxy(logmel: torch.Tensor) -> torch.Tensor:
     x = logmel
@@ -153,13 +98,39 @@ def _wavelets_proxy(logmel: torch.Tensor) -> torch.Tensor:
     return _safe(out)
 
 def logmel_from_wave(wave: torch.Tensor) -> torch.Tensor:
-    """Returnează log-mel [B, M, T] stabil numeric din waveform [B,1,T]."""
+    """Conveniență: log-mel [B,M,T] stabil numeric din waveform [B,1,T]."""
     return _logmel(wave)
+
+def stack_asv_features(wave: torch.Tensor) -> torch.Tensor:
+    """
+    Ordine (exact cum ai cerut): MFCC + Chroma + Spectral Contrast + Temporal + Pitch + Wavelets
+    Returnează [B, C, T_frames].
+    """
+    logmel = _logmel(wave)                          # [B,M,Tf]
+    mfcc = _mfcc_from_logmel(logmel, n_mfcc=20)     # [B,20,Tf]
+
+    B, M, Tf = logmel.shape
+    groups = 12
+    gsize = max(1, M // groups)
+    chroma = []
+    for i in range(groups):
+        s = i * gsize; e = min(M, s + gsize)
+        chroma.append(logmel[:, s:e, :].mean(dim=1, keepdim=True))
+    chroma = _safe(torch.cat(chroma, dim=1))        # [B,12,Tf]
+
+    spec_contrast = _spectral_contrast(logmel, n_bands=6)  # [B,6,Tf]
+    temporal = _temporal_stats(logmel)                     # [B,M+1,Tf]
+    pitch = _pitch_proxy(wave, target_len=Tf)              # [B,1,Tf]
+    wavelets = _wavelets_proxy(logmel)                     # [B,M*4,Tf]
+
+    feats = torch.cat([mfcc, chroma, spec_contrast, temporal, pitch, wavelets], dim=1)
+    feats = _safe(feats)
+    feats = (feats - float(FEATS_MEAN)) / (float(FEATS_STD) + 1e-8)
+    return feats
 
 def stack_asv_features_from_logmel(logmel: torch.Tensor, wave: torch.Tensor) -> torch.Tensor:
     """
-    Construiește stiva în EXACT aceeași ordine ca stack_asv_features(),
-    dar primește logmel deja calculat (pt. a putea folosi mel_fake).
+    Aceeași ordine ca mai sus, dar primește logmel deja calculat (util pentru mel_fake).
     """
     B, M, Tf = logmel.shape
     mfcc = _mfcc_from_logmel(logmel, n_mfcc=20)
@@ -180,24 +151,4 @@ def stack_asv_features_from_logmel(logmel: torch.Tensor, wave: torch.Tensor) -> 
     feats = torch.cat([mfcc, chroma, spec_contrast, temporal, pitch, wavelets], dim=1)
     feats = _safe(feats)
     feats = (feats - float(FEATS_MEAN)) / (float(FEATS_STD) + 1e-8)
-    return feats  # [B, C, Tf]
-
-class MelToWave(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.inv_mel = torchaudio.transforms.InverseMelScale(
-            n_stft=N_FFT // 2 + 1, n_mels=N_MELS, sample_rate=SR
-        )
-        self.griffin = torchaudio.transforms.GriffinLim(
-            n_fft=N_FFT, hop_length=HOP_LENGTH, win_length=WIN_LENGTH, power=1.0, n_iter=60
-        )
-
-    @torch.no_grad()
-    def forward(self, logmel: torch.Tensor) -> torch.Tensor:
-        """
-        logmel: [B, M, T], returnează wave [B, T] (float32, ~[-1,1])
-        """
-        mel = torch.expm1(logmel).clamp(min=0.0)        # inverse log1p
-        spec = self.inv_mel(mel)                        # [B, n_fft//2+1, T]
-        wave = self.griffin(spec)                       # [B, T]
-        return wave
+    return feats
