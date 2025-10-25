@@ -1,4 +1,4 @@
-# constants.py
+#constants.py
 from __future__ import annotations
 from pathlib import Path
 
@@ -11,7 +11,7 @@ N_FFT = 1024
 HOP_LENGTH = 160      # 10 ms @ 16k
 WIN_LENGTH = 400      # 25 ms @ 16k
 
-# Normalizare features (poți ajusta după o trecere pe date)
+# Normalizare features (putem rafina ulterior cu stats din set)
 FEATS_MEAN = 0.0
 FEATS_STD  = 1.0
 
@@ -20,21 +20,21 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "database" / "data"
 
 # ----------------- Antrenare -----------------
-AMP_ENABLED = True
+AMP_ENABLED = False            # <— dezactivat până stabilizăm magnitudinile
 BATCH_SIZE = 32
 EPOCHS = 3
 CRITIC_ITERS = 5
 
-# TTUR
-LR_G = 2e-4
-LR_D = 4e-4
+# TTUR (mai conservator)
+LR_G = 1e-4
+LR_D = 2e-4
 BETA1 = 0.0
 BETA2 = 0.99
 
-# Ponderi pierderi (mai conservator pentru stabilitate inițială)
+# Ponderi pierderi
 LAMBDA_GAN = 1.0
-LAMBDA_SPEC = 1.0        # redus de la 10.0
-LAMBDA_R1 = 5.0          # redus de la 10.0
+LAMBDA_SPEC = 1.0
+LAMBDA_R1 = 1.0              # <— mai mic pentru stabilitate inițială
 
 # ----------------- Logging -----------------
 LOG_INTERVAL = 50
