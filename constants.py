@@ -8,8 +8,8 @@ N_FFT: int = 1024
 WIN_LENGTH: int = 400       # 25 ms @16k
 HOP_LENGTH: int = 160       # 10 ms @16k
 N_MELS: int = 64
-N_MFCC: int = 20
-MAX_SEC: float = 4.0        # crop/pad la ~4s
+N_MFCC: int = 128
+MAX_SEC: float = 2.0        # crop/pad la ~4s
 
 # Ordinea convenită a feature-urilor pentru detectorul ASV Keras
 FEATURE_ORDER = [
