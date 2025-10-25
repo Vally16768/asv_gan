@@ -12,7 +12,7 @@ DATA_DIR = ROOT / "database" / "data"
 # ----------------- Antrenare -----------------
 AMP_ENABLED = False            # lăsăm pe False până stabilizăm
 BATCH_SIZE = 24               # ușor mai mic => variabilitate stabilă pe batch
-EPOCHS = 1
+EPOCHS = 200
 CRITIC_ITERS = 2              # 2 e suficient cu SN + R1 + instance noise
 
 # TTUR (stabil)
