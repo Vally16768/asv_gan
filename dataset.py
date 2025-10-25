@@ -116,12 +116,12 @@ class BonaFideDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         path = self.items[idx].path
-        wav = _load_wav(path)                              # [1, T]
-        wav = _crop_or_pad(wav, self.max_sec, TARGET_SR)   # [1, Tw]
+        wav = _load_wav(path)                               # [1, T]
+        wav = _crop_or_pad(wav, self.max_sec, TARGET_SR)    # [1, Tw]
 
-        mel = self.mel_tf(wav)                             # [1, n_mels, Tm]
+        mel = self.mel_tf(wav)                              # [1, n_mels, Tm]
         mel = self.to_db(mel)
-        mel = (mel - mel.mean()) / (mel.std() + 1e-5)      # normalizare simplă
-        mel = mel.squeeze(0)                               # [n_mels, Tm]
+        mel = (mel - mel.mean()) / (mel.std() + 1e-5)
+        mel = mel.squeeze(0)                                # [n_mels, Tm]
 
-        return {"mel": mel, "wave": wav}
+        return {"mel": mel, "wave": wav, "path": path}      # <-- include path

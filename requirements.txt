@@ -1,9 +1,27 @@
-torch
-torchaudio
-librosa
-soundfile
-tqdm
-numpy
-pandas
-scikit-learn
-speechbrain    # doar dacă USE_SPEAKER_LOSS=True
+# Core frameworks
+torch==2.3.1
+torchaudio==2.3.1
+tensorflow==2.15.0
+keras==2.15.0
+
+# Audio processing
+librosa==0.10.2.post1
+soundfile==0.12.1
+pywavelets==1.6.0
+audioread==3.0.1
+
+# Data science stack
+numpy==1.26.4
+scipy==1.13.1
+pandas==2.2.2
+
+# Utilities and logging
+tqdm==4.66.4
+matplotlib==3.9.2
+seaborn==0.13.2
+scikit-learn==1.5.1
+
+# Serialization / misc
+joblib==1.4.2
+protobuf==4.25.3
+h5py==3.11.0
