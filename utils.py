@@ -1,4 +1,3 @@
-# utils.py
 import csv
 import random
 from pathlib import Path
@@ -8,57 +7,39 @@ import numpy as np
 import torch
 import torchaudio
 
-# Fallback opțional pentru citire audio (unele build-uri de torchaudio nu au FLAC)
+# Fallback opțional pentru citire audio
 try:
     import soundfile as sf  # type: ignore
     _HAS_SF = True
 except Exception:
     _HAS_SF = False
 
-# Extensii audio suportate (lowercase)
 AUDIO_EXTS = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".aac"}
 
-
 def set_seed(seed: int = 42, deterministic_cuda: bool = True) -> None:
-    """
-    Setează seed-uri pentru reproducibilitate.
-    Dacă deterministic_cuda=True, forțează cudnn să fie determinist (ușor mai lent).
-    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
         if deterministic_cuda:
-            torch.backends.cudnn.deterministic = True  # type: ignore[attr-defined]
-            torch.backends.cudnn.benchmark = False     # type: ignore[attr-defined]
-
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
 def is_audio_file(path: str) -> bool:
-    """Verifică extensia fișierului (case-insensitive)."""
     return Path(path).suffix.lower() in AUDIO_EXTS
 
-
 def _info_via_torchaudio(path: str) -> Tuple[int, int]:
-    """Metadate cu torchaudio: (sample_rate, num_frames)."""
     info = torchaudio.info(path)
     return int(info.sample_rate), int(info.num_frames)
 
-
 def _info_via_soundfile(path: str) -> Tuple[int, int]:
-    """Fallback metadate cu soundfile (dacă e instalat)."""
     if not _HAS_SF:
         raise RuntimeError("soundfile indisponibil ca fallback")
     i = sf.info(path)  # type: ignore
     return int(i.samplerate), int(i.frames)
 
-
 def _safe_audio_info(path: str) -> Tuple[int, int]:
-    """
-    Obține (sample_rate, num_frames) cu torchaudio, cu fallback la soundfile.
-    Ridică ultima excepție dacă nu se poate citi.
-    """
     last_err: Optional[Exception] = None
     for reader in (_info_via_torchaudio, _info_via_soundfile):
         try:
@@ -68,19 +49,11 @@ def _safe_audio_info(path: str) -> Tuple[int, int]:
     assert last_err is not None
     raise last_err
 
-
 def duration_seconds(path: str) -> float:
-    """Durata fișierului audio în secunde (float)."""
     sr, frames = _safe_audio_info(path)
     return float(frames) / float(sr) if sr > 0 else 0.0
 
-
 def _gather_candidates(root: Path, use_patterns: bool) -> List[Path]:
-    """
-    Colectează fișiere candidate (extensii audio).
-    - use_patterns=True: folosește rglob pe fiecare extensie (rapid și strict).
-    - use_patterns=False: iterează toate fișierele și filtrează cu is_audio_file.
-    """
     candidates: List[Path] = []
     if use_patterns:
         for ext in AUDIO_EXTS:
@@ -89,8 +62,6 @@ def _gather_candidates(root: Path, use_patterns: bool) -> List[Path]:
         for p in root.rglob("*"):
             if p.is_file() and is_audio_file(str(p)):
                 candidates.append(p)
-
-    # Elimină dubluri și normalizează
     uniq: List[Path] = []
     seen = set()
     for p in candidates:
@@ -100,19 +71,7 @@ def _gather_candidates(root: Path, use_patterns: bool) -> List[Path]:
             uniq.append(p)
     return uniq
 
-
-def scan_data_folder(
-    root_dir: str,
-    use_patterns: bool = True,
-    verbose: bool = False,
-    save_csv: Optional[str] = None,
-) -> List[Tuple[str, int, float]]:
-    """
-    Enumeră recursiv fișierele audio din `root_dir` și întoarce o listă:
-        (path, sample_rate, seconds)
-
-    Nu șterge nimic — e doar sanity-check.
-    """
+def scan_data_folder(root_dir: str, use_patterns: bool = True, verbose: bool = False, save_csv: Optional[str] = None) -> List[Tuple[str, int, float]]:
     root = Path(root_dir)
     if verbose:
         print(f"[info] scanning: {root.resolve()}")
@@ -160,31 +119,18 @@ def scan_data_folder(
 
     return out
 
-
-# --- Utilitare simple pentru pipeline-uri ---
-
 def list_audio_paths(root_dir: str) -> List[str]:
-    """Întoarce toate căile fișierelor audio (recursiv), fără a citi metadate."""
     root = Path(root_dir)
     return [str(p) for p in _gather_candidates(root, use_patterns=True)]
 
-
 def has_audio_under(root_dir: str) -> bool:
-    """True dacă există cel puțin un fișier audio sub `root_dir`."""
     root = Path(root_dir)
     for ext in AUDIO_EXTS:
         if any(root.rglob(f"*{ext}")):
             return True
     return False
 
-
-# --- Audio I/O convenabil ---
-
 def save_wav(path: str, wav_tensor: torch.Tensor, sr: int = 16000):
-    """
-    Salvează waveform în .wav (folosește soundfile).
-    wav_tensor: 1D sau 2D (dacă 2D, salvează primul exemplu).
-    """
     import soundfile as sf  # lazy import
     path = str(path)
     if isinstance(wav_tensor, torch.Tensor):
@@ -195,14 +141,7 @@ def save_wav(path: str, wav_tensor: torch.Tensor, sr: int = 16000):
         arr = arr[0]
     sf.write(path, arr, sr)
 
-
-# --- Vocoder HiFi-GAN (opțional) ---
-
 class HiFiGANVocoder:
-    """
-    Wrapper minimal peste un HiFi-GAN TorchScript (.jit/.pt) care primește mel [B, n_mels, T]
-    și întoarce waveform [B, L]. Dacă nu ai modelul, înlocuiește-l în codul de train/eval.
-    """
     def __init__(self, jit_path: Optional[str], device: str = "cpu"):
         self.jit_path = str(jit_path) if jit_path else None
         self.device = torch.device(device if torch.cuda.is_available() and device != "cpu" else "cpu")
@@ -220,16 +159,7 @@ class HiFiGANVocoder:
         with torch.inference_mode():
             return self.model(mel.to(self.device)).detach().cpu()
 
-
-# --- Detectoare ASV (Keras) ---
-
-# Fallback pentru ExtractConfig (dacă features.py nu o definește/nu poate fi importată)
-try:
-    from features import ExtractConfig  # type: ignore
-except Exception:
-    ExtractConfig = Any  # type: ignore
-
-# Import defensiv al wrapper-ului Keras (nu blocăm importul utils dacă lipsesc dependențe)
+# Detectoare Keras (import defensiv)
 try:
     from detector_keras import KerasASVDetector  # type: ignore
     _HAS_KERAS_DET = True
@@ -238,16 +168,7 @@ except Exception:
     class KerasASVDetector:  # type: ignore
         pass
 
-
-def load_detectors(
-    detector_paths: Sequence[str],
-    device: str = "cpu",
-    cfg: Optional[ExtractConfig] = None
-):
-    """
-    Încarcă o listă de detectoare. Pentru fișiere Keras (.keras/.h5/.hdf5) folosește KerasASVDetector.
-    Pentru alte formate, implementează wrapper-ele aferente după nevoie.
-    """
+def load_detectors(detector_paths: Sequence[str], device: str = "cpu", cfg: Optional[Any] = None):
     detectors: List[Any] = []
     for p in detector_paths:
         pstr = str(p)
@@ -262,29 +183,17 @@ def load_detectors(
             except Exception as e:
                 print(f"[load_detectors] Could not load Keras detector {pstr}: {e}")
         else:
-            print(f"[load_detectors] Unknown detector format for {pstr} — skipping (add wrapper if needed)")
+            print(f"[load_detectors] Unknown detector format for {pstr} — skipping")
     return detectors
 
-
-def run_ensemble_detectors(
-    detectors: Sequence[Any],
-    *,
-    wave: Optional[torch.Tensor] = None,
-    mel: Optional[torch.Tensor] = None,
-    sr: int = 16000
-) -> List[torch.Tensor]:
-    """
-    Rulează toate detectoarele și întoarce o listă de scoruri (torch.Tensors scalar).
-    Pentru KerasASVDetector apelăm score_wave pe un numpy waveform.
-    """
+def run_ensemble_detectors(detectors: Sequence[Any], *, wave: Optional[torch.Tensor] = None, mel: Optional[torch.Tensor] = None, sr: int = 16000) -> List[torch.Tensor]:
     out: List[torch.Tensor] = []
     for d in detectors:
         try:
             if isinstance(d, KerasASVDetector) and hasattr(d, "score_wave"):
-                # Convertim torch waveform la numpy dacă e cazul
                 if isinstance(wave, torch.Tensor):
                     w_np = wave.detach().cpu().numpy()
-                    if w_np.ndim == 2:  # [B, L] -> ia primul exemplu
+                    if w_np.ndim == 2:
                         w_np = w_np[0]
                 elif isinstance(wave, np.ndarray):
                     w_np = wave
