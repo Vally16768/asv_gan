@@ -41,3 +41,13 @@ LOG_INTERVAL = 50
 VAL_INTERVAL = 1
 SAVE_DIR = ROOT / "checkpoints"
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ----------------- ASVspoof (black-box evasion) -----------------
+ASV_MODEL_DIR   = ROOT / "ASVmodel"          # conține best_model.keras
+ASV_SCALER      = ASV_MODEL_DIR / "scaler.pkl"
+ASV_COMBO       = "AHKMNO"                   # codul tău default
+ASV_SR          = SR
+
+EVASION_LAMBDA  = 1.0     # forță penalizare
+EVASION_EVERY   = 5       # o dată la N pași
+TARGET_LABEL    = "bona_fide"  # dacă există labels.txt (altfel index=0)

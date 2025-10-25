@@ -151,3 +151,53 @@ def _wavelets_proxy(logmel: torch.Tensor) -> torch.Tensor:
         outs.append(y.reshape_as(x))
     out = torch.cat(outs, dim=1)  # [B, M*4, T]
     return _safe(out)
+
+def logmel_from_wave(wave: torch.Tensor) -> torch.Tensor:
+    """Returnează log-mel [B, M, T] stabil numeric din waveform [B,1,T]."""
+    return _logmel(wave)
+
+def stack_asv_features_from_logmel(logmel: torch.Tensor, wave: torch.Tensor) -> torch.Tensor:
+    """
+    Construiește stiva în EXACT aceeași ordine ca stack_asv_features(),
+    dar primește logmel deja calculat (pt. a putea folosi mel_fake).
+    """
+    B, M, Tf = logmel.shape
+    mfcc = _mfcc_from_logmel(logmel, n_mfcc=20)
+
+    groups = 12
+    gsize = max(1, M // groups)
+    chroma = []
+    for i in range(groups):
+        s = i * gsize; e = min(M, s + gsize)
+        chroma.append(logmel[:, s:e, :].mean(dim=1, keepdim=True))
+    chroma = _safe(torch.cat(chroma, dim=1))
+
+    spec_contrast = _spectral_contrast(logmel, n_bands=6)
+    temporal = _temporal_stats(logmel)
+    pitch = _pitch_proxy(wave, target_len=Tf)
+    wavelets = _wavelets_proxy(logmel)
+
+    feats = torch.cat([mfcc, chroma, spec_contrast, temporal, pitch, wavelets], dim=1)
+    feats = _safe(feats)
+    feats = (feats - float(FEATS_MEAN)) / (float(FEATS_STD) + 1e-8)
+    return feats  # [B, C, Tf]
+
+class MelToWave(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.inv_mel = torchaudio.transforms.InverseMelScale(
+            n_stft=N_FFT // 2 + 1, n_mels=N_MELS, sample_rate=SR
+        )
+        self.griffin = torchaudio.transforms.GriffinLim(
+            n_fft=N_FFT, hop_length=HOP_LENGTH, win_length=WIN_LENGTH, power=1.0, n_iter=60
+        )
+
+    @torch.no_grad()
+    def forward(self, logmel: torch.Tensor) -> torch.Tensor:
+        """
+        logmel: [B, M, T], returnează wave [B, T] (float32, ~[-1,1])
+        """
+        mel = torch.expm1(logmel).clamp(min=0.0)        # inverse log1p
+        spec = self.inv_mel(mel)                        # [B, n_fft//2+1, T]
+        wave = self.griffin(spec)                       # [B, T]
+        return wave
