@@ -175,3 +175,55 @@ def stack_asv_features(wave: torch.Tensor) -> torch.Tensor:
     logmel = logmel_from_wave(wave)                # [B, M, T]
     feats = _stack_combo_from_logmel_core(logmel)  # [B, C, T]
     return _normalize_feats(feats)
+
+# === ADD at end of features.py ===
+import torch.nn.functional as F
+import numpy as np
+
+def _delta_along_time(x: torch.Tensor) -> torch.Tensor:
+    """
+    x: [B, C, T] -> deltas pe axa timp (kernel[-1,0,1]) cu padding replicat.
+    """
+    if x.dim() != 3:
+        raise ValueError("Expected [B,C,T] for delta computation")
+    B, C, T = x.shape
+    k = torch.tensor([[-1.0, 0.0, 1.0]], device=x.device, dtype=x.dtype).view(1, 1, 3)
+    y = F.pad(x, (1, 1), mode="replicate")
+    # depthwise conv: aplicăm același kernel fiecărui canal
+    y = F.conv1d(y, k.expand(C, 1, 3), groups=C)
+    y = y / 2.0
+    return y
+
+@torch.no_grad()
+def make_asv_vector_from_wave(wave: torch.Tensor) -> torch.Tensor:
+    """
+    Construiește vectorul ASV de 61-D (MFCC20 + delta20 + deltadelta20 + energie1) AGREGAT pe timp (mean).
+      - wave: [B,1,T] sau [B,T]
+      - return: [B, 61] float32
+    NOTE:
+      • Folosim log-mel -> MFCC (20) exact ca _mfcc_from_logmel().
+      • Δ = derivata temporală pe fiecare coeficient MFCC.
+      • Δ² = derivata temporală a lui Δ.
+      • 'energie' = media pe timp a log-mel-ului (scalar).
+    """
+    if wave.dim() == 2:
+        wave = wave.unsqueeze(1)  # [B,1,T]
+    B = wave.size(0)
+
+    logmel = _logmel(wave.squeeze(1))        # [B,M,Tf]
+    mfcc = _mfcc_from_logmel(logmel, n_mfcc=20)  # [B,20,Tf]
+
+    d1 = _delta_along_time(mfcc)              # [B,20,Tf]
+    d2 = _delta_along_time(d1)                # [B,20,Tf]
+
+    # energie scalară (media log-mel pe timp și benzi)
+    energy = logmel.mean(dim=(1,2), keepdim=True)  # [B,1]
+
+    # agregare pe timp (mean) pentru toate canalele
+    mfcc_mean = mfcc.mean(dim=-1)             # [B,20]
+    d1_mean   = d1.mean(dim=-1)               # [B,20]
+    d2_mean   = d2.mean(dim=-1)               # [B,20]
+
+    vec = torch.cat([mfcc_mean, d1_mean, d2_mean, energy], dim=1).to(torch.float32)  # [B,61]
+    # stabilizare (opțional) — nu standardizăm aici; lăsăm scalerul extern / layerul Keras
+    return vec
