@@ -1,26 +1,20 @@
-# train.py — stabilizat + best-only saves (checkpoints + samples) în checkpoints/, torchrun-safe
+# train.py — ASV-GAN strict + WGAN-R1 + evasion loss + annealing + samples/metrics per epoch + best-at-epoch
 from __future__ import annotations
-import os, csv, time
 from pathlib import Path
-from typing import Optional
-
+import os, json, csv, time
 import numpy as np
+
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
+import torch.nn.functional as F
 import torchaudio
-import multiprocessing as mp
+import joblib
 
-# ----------------- Setări robuste la pornire (înainte de DataLoader/TF) -----------------
-try:
-    mp.set_start_method("spawn", force=True)
-except RuntimeError:
-    pass
+from scipy.special import softmax
 
-torch.set_float32_matmul_precision("high")
-
-# ----------------- Imports proiect -----------------
+# ----------------- Proiect -----------------
 from constants import (
     # audio/feats
     SR, N_MELS, N_FFT, HOP_LENGTH, WIN_LENGTH,
@@ -30,52 +24,38 @@ from constants import (
     LR_G, LR_D, BETA1, BETA2,
     LAMBDA_GAN, LAMBDA_SPEC, LAMBDA_R1,
     LOG_INTERVAL, VAL_INTERVAL, SAVE_DIR, ROOT,
-    # schedules
+    # Schedules
     DELTA_INIT, DELTA_MIN, DELTA_DECAY,
     INST_NOISE_INIT, INST_NOISE_MIN, INST_NOISE_DECAY,
-    # early stop
+    # Early stop
     EARLY_STOP_ENABLED, EARLY_STOP_PATIENCE, EARLY_STOP_METRIC,
-    # ASV
-    ASV_MODEL_DIR, ASV_SCALER, ASV_COMBO, ASV_SR,
+    # ASVspoof
+    ASV_MODEL_DIR, ASV_SCALER, ASV_SR, ASV_COMBO,
     EVASION_LAMBDA, EVASION_EVERY, TARGET_LABEL,
 )
-from dataset import ASVBonafideDataset
+from dataset import ASVBonafideDataset, pad_collate
 from models import Generator, Critic
 from losses import wgan_g_loss, wgan_d_loss, r1_regularizer
-from utils import EMA
+from utils import set_seed
 
-# ---------- rank/helpers (torchrun-safe) ----------
-def get_rank() -> int:
-    try:
-        return int(os.environ.get("RANK", "0"))
-    except Exception:
-        return 0
+# detector keras (obligatoriu)
+from detector_keras import load_keras_model
 
-def get_local_rank() -> int:
-    try:
-        return int(os.environ.get("LOCAL_RANK", "0"))
-    except Exception:
-        return 0
-
-def is_main_process() -> bool:
-    return get_rank() == 0
-
-# ---------- tqdm (opțional) ----------
+# tqdm (optional)
 try:
-    from tqdm import tqdm
-except Exception:  # pragma: no cover
-    tqdm = lambda x, **k: x  # type: ignore
+    from tqdm.auto import tqdm
+except Exception:
+    def tqdm(x, **k): return x
 
-# ---------- TensorBoard (opțional) ----------
-try:
-    from torch.utils.tensorboard import SummaryWriter
-except Exception:  # pragma: no cover
-    SummaryWriter = None  # type: ignore
+# ----------------- Seed & device -----------------
+set_seed(42)
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ============================================================
-# ================  Features & Transformări  =================
-# ============================================================
+# ----------------- Helpers stabilitate -----------------
+def _safe(x: torch.Tensor) -> torch.Tensor:
+    return torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
 
+# ---------- Mel (device-aware) & Griffin-Lim ----------
 _mel = torchaudio.transforms.MelSpectrogram(
     sample_rate=SR,
     n_fft=N_FFT,
@@ -87,18 +67,17 @@ _mel = torchaudio.transforms.MelSpectrogram(
     power=1.0,
     norm="slaney",
     mel_scale="htk",
-)
-
-def _safe(x: torch.Tensor) -> torch.Tensor:
-    return torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+).to(device)
 
 def logmel_from_wave(wave: torch.Tensor) -> torch.Tensor:
     """
-    wave: [B, 1, T] float32 in [-1,1]
-    return: log1p(mel) în [B, M, T']
+    [B,1,T] / [B,T] -> logmel [B,M,Tf]
     """
-    mel = _mel.to(wave.device)(wave.squeeze(1))  # [B, M, T]
-    mel = torch.log1p(mel).clamp(-8.0, 8.0)
+    if wave.dim() == 3 and wave.size(1) == 1:
+        wave = wave.squeeze(1)
+    wave = wave.to(device)
+    mel = _mel(wave)
+    mel = torch.log1p(torch.clamp(mel, min=0.0))
     return _safe(mel)
 
 class MelToWave(nn.Module):
@@ -114,513 +93,558 @@ class MelToWave(nn.Module):
             hop_length=HOP_LENGTH,
             win_length=WIN_LENGTH,
             power=1.0,
-            n_iter=80,
+            n_iter=60
         )
 
     @torch.no_grad()
     def forward(self, logmel: torch.Tensor) -> torch.Tensor:
-        self.inv_mel = self.inv_mel.to(logmel.device)
-        self.griffin = self.griffin.to(logmel.device)
+        """
+        logmel [B,M,Tf] -> wave [B,1,T]
+        """
         mel = torch.expm1(logmel).clamp(min=0.0)
-        spec = self.inv_mel(mel)
-        wave = self.griffin(spec)
-        return wave
+        mag = self.inv_mel.to(logmel.device)(mel)
+        wave = self.griffin.to(logmel.device)(mag)
+        return wave.unsqueeze(1)
+
+mel2wav = MelToWave().to(device)
+
+# ---------- Vector ASV 61-D (caching DCT) ----------
+_DCT_CACHE = {}
+def _delta_along_time(x: torch.Tensor) -> torch.Tensor:
+    if x.dim() != 3:
+        raise ValueError("Expected [B,C,T] for delta computation")
+    C = x.shape[1]
+    k = torch.tensor([[-1.0, 0.0, 1.0]], device=x.device, dtype=x.dtype).view(1, 1, 3)
+    y = F.pad(x, (1, 1), mode="replicate")
+    y = F.conv1d(y, k.expand(C, 1, 3), groups=C) / 2.0
+    return y
 
 def _mfcc_from_logmel(logmel: torch.Tensor, n_mfcc: int = 20) -> torch.Tensor:
+    import math
     B, M, T = logmel.shape
-    device, dtype = logmel.device, logmel.dtype
-    torch.manual_seed(0)
-    W = torch.randn(M, n_mfcc, device=device, dtype=dtype) / np.sqrt(M)
-    mfcc = torch.einsum("bmt,mk->bkt", logmel, W)
-    return _safe(mfcc)
+    key = (M, n_mfcc, logmel.device, logmel.dtype)
+    if key not in _DCT_CACHE:
+        m = torch.arange(M, device=logmel.device, dtype=logmel.dtype)
+        k = torch.arange(M, device=logmel.device, dtype=logmel.dtype).unsqueeze(1)
+        scale = torch.sqrt(torch.tensor(2.0 / M, device=logmel.device, dtype=logmel.dtype))
+        dct = scale * torch.cos((math.pi / M) * (m + 0.5) * k)
+        dct[0] = dct[0] / math.sqrt(2.0)
+        _DCT_CACHE[key] = dct.t()   # [M,M]
+    dctT = _DCT_CACHE[key]         # [M,M]
+    x = logmel.transpose(1, 2)     # [B,T,M]
+    mfcc = x @ dctT[:, :n_mfcc]    # [B,T,n_mfcc]
+    return _safe(mfcc.transpose(1, 2))
 
-def _spectral_contrast(logmel: torch.Tensor, n_bands: int = 6) -> torch.Tensor:
-    B, M, T = logmel.shape
-    bands = []
-    step = max(1, M // n_bands)
-    for i in range(n_bands):
-        s = i * step
-        e = min(M, s + step)
-        chunk = logmel[:, s:e, :]
-        bands.append(chunk.max(dim=1, keepdim=True).values - chunk.min(dim=1, keepdim=True).values)
-    return _safe(torch.cat(bands, dim=1))
+@torch.no_grad()
+def make_asv_vector_from_wave(wave: torch.Tensor) -> torch.Tensor:
+    if wave.dim() == 2:
+        wave = wave.unsqueeze(1)
+    logmel = logmel_from_wave(wave)                 # [B,M,Tf]
+    mfcc  = _mfcc_from_logmel(logmel, n_mfcc=20)    # [B,20,Tf]
+    d1    = _delta_along_time(mfcc)                 # [B,20,Tf]
+    d2    = _delta_along_time(d1)                   # [B,20,Tf]
+    energy = logmel.mean(dim=(1,2), keepdim=False)  # [B]
+    vec = torch.cat([
+        mfcc.mean(dim=-1), d1.mean(dim=-1), d2.mean(dim=-1),
+        energy.view(-1, 1)
+    ], dim=1).to(torch.float32)                     # [B,61]
+    return vec
 
-def _temporal_stats(logmel: torch.Tensor) -> torch.Tensor:
-    mu = logmel.mean(dim=1, keepdim=True)
-    sd = logmel.std(dim=1, keepdim=True)
-    d1 = torch.cat([torch.zeros_like(logmel[:, :, :1]), logmel[:, :, 1:] - logmel[:, :, :-1]], dim=2)
-    d1 = d1.mean(dim=1, keepdim=True)
-    return _safe(torch.cat([mu, sd, d1], dim=1))
+# ----------------- ASVspoof REQUIRE (no fallbacks) -----------------
+def _require_file(p: Path, what: str):
+    if not Path(p).exists():
+        raise FileNotFoundError(f"[ASV REQUIRE] Missing {what}: {p}. Aborting.")
 
-def _wavelets_proxy(logmel: torch.Tensor) -> torch.Tensor:
-    outs = []
-    for s in (3, 5, 9):
-        k = torch.ones(1, 1, s, device=logmel.device, dtype=logmel.dtype) / s
-        y = torch.nn.functional.conv1d(logmel.reshape(-1, 1, logmel.shape[-1]), k, padding=s//2)
-        outs.append(y.reshape_as(logmel))
-    return _safe(torch.cat(outs, dim=1))
-
-def _pitch_from_mel_proxy(logmel: torch.Tensor) -> torch.Tensor:
-    B, M, T = logmel.shape
-    freqs = torch.linspace(0.0, 1.0, M, device=logmel.device, dtype=logmel.dtype).view(1, M, 1)
-    w = torch.exp(logmel).clamp_min(1e-8)
-    centroid = (w * freqs).sum(dim=1, keepdim=True) / w.sum(dim=1, keepdim=True)
-    return _safe(centroid)
-
-def feats_from_mel_no_wave(logmel: torch.Tensor) -> torch.Tensor:
-    B, M, T = logmel.shape
-    mfcc = _mfcc_from_logmel(logmel, n_mfcc=20)
-    groups, gsize = 12, max(1, M // 12)
-    chroma = []
-    for i in range(groups):
-        s = i * gsize; e = min(M, s + gsize)
-        chroma.append(logmel[:, s:e, :].mean(dim=1, keepdim=True))
-    chroma = _safe(torch.cat(chroma, dim=1))
-    spec_contrast = _spectral_contrast(logmel, n_bands=6)
-    temporal = _temporal_stats(logmel)
-    pitch_like = _pitch_from_mel_proxy(logmel)
-    wavelets = _wavelets_proxy(logmel)
-    feats = torch.cat([mfcc, chroma, spec_contrast, temporal, pitch_like, wavelets], dim=1)
-    feats = _safe(feats)
-    feats = (feats - float(FEATS_MEAN)) / (float(FEATS_STD) + 1e-8)
-    return feats
-
-try:
-    from features import stack_asv_features as feats_from_wave
-except Exception:
-    def feats_from_wave(wave: torch.Tensor) -> torch.Tensor:
-        logmel = logmel_from_wave(wave)
-        return feats_from_mel_no_wave(logmel)
-
-# ============================================================
-# ================        ASVspoof wrapper      ===============
-# ============================================================
-
-def load_keras_safe() -> Optional[object]:
-    try:
-        # ————— Reduce drastic log-urile TF —————
-        os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")   # 0=ALL, 1=INFO, 2=WARNING, 3=ERROR
-        os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")  # oprește mesajele oneDNN
-
-        import tensorflow as tf
-        try:
-            # Nu lăsăm TF să vadă GPU-urile -> nu mai încearcă cuDNN/cuBLAS/TRT
-            tf.config.set_visible_devices([], "GPU")
-            # Închidem loggerul TF
-            tf.get_logger().setLevel("ERROR")
-        except Exception:
-            pass
-
-        # (opțional) reducere și pentru absl
-        try:
-            import absl.logging
-            absl.logging.set_verbosity(absl.logging.ERROR)
-        except Exception:
-            pass
-
-        from detector_keras import load_keras_model
-
-        for name in ("best_model.keras", "best_model.h5"):
-            p = ASV_MODEL_DIR / name
-            if p.exists():
-                return load_keras_model(p)  # va rula pe CPU, silențios
-    except Exception:
-        pass
-    return None
-
-def asv_evasion_penalty(keras_model, logmel_fake: torch.Tensor) -> torch.Tensor:
-    try:
-        feats = feats_from_mel_no_wave(logmel_fake)
-        mu, sd = feats.mean(dim=-1), feats.std(dim=-1)
-        pooled = torch.cat([mu, sd], dim=1)
-        x_np = pooled.detach().cpu().numpy()
-        preds = keras_model.predict(x_np, verbose=0).ravel()
-        if not (np.all(preds >= 0.0) and np.all(preds <= 1.0)):
-            from scipy.special import expit
-            preds = expit(preds)
-        loss_np = (1.0 - preds).mean()
-        return torch.tensor(loss_np, dtype=logmel_fake.dtype, device=logmel_fake.device)
-    except Exception:
-        return torch.tensor(0.0, dtype=logmel_fake.dtype, device=logmel_fake.device)
-
-# ============================================================
-# ================        Utilitare train      ===============
-# ============================================================
-
-def add_instance_noise(x: torch.Tensor, std: float) -> torch.Tensor:
-    if std <= 0.0:
-        return x
-    return _safe(x + torch.randn_like(x) * std)
-
-class EarlyStopper:
-    def __init__(self, patience: int, mode: str = "min"):
-        self.patience = patience
-        self.mode = mode
-        self.best: Optional[float] = None
-        self.bad_epochs = 0
-
-    def step(self, value: float) -> bool:
-        if self.best is None:
-            self.best = value
-            return False
-        improved = (value < self.best) if self.mode == "min" else (value > self.best)
-        if improved:
-            self.best = value
-            self.bad_epochs = 0
-            return False
-        self.bad_epochs += 1
-        return self.bad_epochs > self.patience
-
-# ============================================================
-# ================   Collate (nivel de modul!)  ==============
-# ============================================================
-
-def collate_pad(batch):
-    # batch: listă de dict-uri cu {'wave': [1,T]}
-    waves = [b["wave"] for b in batch if b is not None]
-    if len(waves) == 0:
-        T = int(0.5 * SR)
-        waves = [torch.zeros(1, T) for _ in range(1)]
-    maxT = max(w.shape[-1] for w in waves)
-    waves = [torch.nn.functional.pad(w, (0, maxT - w.shape[-1])) for w in waves]
-    waves = torch.stack(waves, dim=0).float()  # [B,1,T]
-    return {"wave": waves}
-
-# ============================================================
-# ================           main()            ===============
-# ============================================================
-
-def main():
-    # Selecție corectă GPU pe proces
-    if torch.cuda.is_available():
-        local_rank = get_local_rank()
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
-        torch.backends.cudnn.benchmark = True
+def _load_required_asv_assets():
+    # model obligatoriu (keras .keras sau .h5)
+    model_main = Path(ASV_MODEL_DIR) / "best_model.keras"
+    model_alt  = Path(ASV_MODEL_DIR) / "best_model.h5"
+    if model_main.exists():
+        model_path = model_main
+    elif model_alt.exists():
+        model_path = model_alt
     else:
-        device = torch.device("cpu")
+        raise FileNotFoundError(
+            f"[ASV REQUIRE] Missing Keras model. Expected one of:\n"
+            f"  - {model_main}\n  - {model_alt}"
+        )
+    keras_model = load_keras_model(model_path)
 
-    # ----------------- I/O dirs (rank 0) -----------------
-    base_save = Path(SAVE_DIR)
-    if not base_save.is_absolute():
-        base_save = Path(ROOT) / base_save
-    save_dir = base_save  # ex: checkpoints/
-    samples_dir = save_dir / "samples"
-    tb_dir = save_dir / "tb"
-    plots_dir = save_dir / "plots"
-    if is_main_process():
-        save_dir.mkdir(parents=True, exist_ok=True)
-        samples_dir.mkdir(parents=True, exist_ok=True)
-        plots_dir.mkdir(parents=True, exist_ok=True)
+    # scaler obligatoriu
+    _require_file(ASV_SCALER, "ASV scaler")
+    scaler = joblib.load(str(ASV_SCALER))
+    dim = None
+    if hasattr(scaler, "mean_"):
+        dim = int(np.array(scaler.mean_).size)
+    elif hasattr(scaler, "scale_"):
+        dim = int(np.array(scaler.scale_).size)
+    if dim != 61:
+        raise RuntimeError(f"[ASV REQUIRE] Scaler dim must be 61, got: {dim}")
 
-    # ----------------- Date -----------------
-    train_set = ASVBonafideDataset(split="train")
-    val_set   = ASVBonafideDataset(split="val")
+    # labels & target
+    labels_path = Path(ASV_MODEL_DIR) / "labels.txt"
+    _require_file(labels_path, "ASV labels.txt")
+    labels = [ln.strip() for ln in labels_path.read_text().splitlines() if ln.strip()]
+    if TARGET_LABEL not in labels:
+        raise RuntimeError(f"[ASV REQUIRE] TARGET_LABEL='{TARGET_LABEL}' not found in labels.txt ({labels_path}).")
+    target_idx = labels.index(TARGET_LABEL)
 
-    # Parametri conservatori per-proces (poți crește după ce e stabil)
-    train_workers = int(os.environ.get("TRAIN_WORKERS", "1"))
-    val_workers   = int(os.environ.get("VAL_WORKERS", "0"))
+    return keras_model, scaler, target_idx, labels
 
-    train_loader = DataLoader(
-        train_set,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=train_workers,
-        collate_fn=collate_pad,
-        drop_last=True,
-        persistent_workers=False,
-        pin_memory=False,
-        multiprocessing_context=("spawn" if train_workers > 0 else None),
-        prefetch_factor=(2 if train_workers > 0 else None),
-    )
-    val_loader   = DataLoader(
-        val_set,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=val_workers,
-        collate_fn=collate_pad,
-        drop_last=False,
-        persistent_workers=False,
-        pin_memory=False,
-        multiprocessing_context=("spawn" if val_workers > 0 else None),
-    )
+# ----------------- Training utils -----------------
+def save_checkpoint(state: dict, name: str):
+    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    path = SAVE_DIR / name
+    torch.save(state, path)
+    return path
 
-    # ----------------- Modele -----------------
-    with torch.no_grad():
-        tmp_wave = torch.zeros(2, 1, int(1.0 * SR))
-        tmp_mel  = logmel_from_wave(tmp_wave)
-        tmp_feats = feats_from_mel_no_wave(tmp_mel)
-        C_feat = tmp_feats.shape[1]
+def spec_l1(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return F.l1_loss(a, b)
 
+def save_audio_batch(prefix_dir: Path, waves: torch.Tensor, sr: int, max_items: int = 4, tag: str = "fake"):
+    prefix_dir.mkdir(parents=True, exist_ok=True)
+    B = waves.shape[0]
+    n = min(B, max_items)
+    w = waves.detach().cpu().clamp(-1, 1)
+    for i in range(n):
+        path = prefix_dir / f"{tag}_{i:02d}.wav"
+        torchaudio.save(str(path), w[i], sr)
+
+def write_hparams_json(path: Path, hparams: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(hparams, f, indent=2, sort_keys=True)
+
+# ----------------- MAIN -----------------
+def main():
+    print("== ASV-GAN Training (strict) ==")
+    print(f"Device: {device}")
+    print(f"Dataset root: {ROOT}")
+
+    # Require ASV assets
+    keras_model, asv_scaler, target_idx, labels = _load_required_asv_assets()
+    print(f"[ASV] Using model at: {ASV_MODEL_DIR}")
+    print(f"[ASV] Using scaler:   {ASV_SCALER} (dim=61)  target='{TARGET_LABEL}' idx={target_idx}")
+
+    # === Detectare head (sigmoid vs softmax) ===
+    _probe = np.zeros((1, 61), dtype="float32")
+    _probe = asv_scaler.transform(_probe)
+    _pred = keras_model.predict(_probe, verbose=0)
+    if _pred.ndim != 2:
+        raise RuntimeError(f"[ASV REQUIRE] Modelul trebuie să dea un 2D array [B,C]. Am primit shape={_pred.shape}")
+
+    num_classes = _pred.shape[1]
+    if num_classes == 1:
+        asv_head = "sigmoid"
+        if len(labels) != 2:
+            raise RuntimeError(f"[ASV REQUIRE] Pentru head sigmoid (C=1) labels.txt trebuie să aibă EXACT 2 clase; are {len(labels)}.")
+        neg_label, pos_label = labels[0], labels[1]
+        if TARGET_LABEL == pos_label:
+            sigmoid_mapping = "target_is_pos"
+        elif TARGET_LABEL == neg_label:
+            sigmoid_mapping = "target_is_neg"
+        else:
+            raise RuntimeError(f"[ASV REQUIRE] TARGET_LABEL='{TARGET_LABEL}' nu se găsește în labels.txt.")
+        print(f"[ASV] Head: sigmoid (C=1). Pos='{pos_label}', Neg='{neg_label}', map='{sigmoid_mapping}'.")
+    else:
+        asv_head = "softmax"
+        if target_idx >= num_classes:
+            raise RuntimeError(f"[ASV REQUIRE] target_idx={target_idx} depășește num_classes={num_classes}")
+        print(f"[ASV] Head: softmax (C={num_classes}). TARGET idx={target_idx}")
+
+    # Models
     G = Generator(c_in=N_MELS).to(device)
-    D = Critic(c_in=C_feat).to(device)
-    ema = EMA(G, decay=0.999)
+    D = Critic(c_in=N_MELS).to(device)
 
+    # Opts
     optG = optim.Adam(G.parameters(), lr=LR_G, betas=(BETA1, BETA2))
     optD = optim.Adam(D.parameters(), lr=LR_D, betas=(BETA1, BETA2))
+    scaler = GradScaler(enabled=AMP_ENABLED)
 
-    scalerG = GradScaler(enabled=AMP_ENABLED)
-    scalerD = GradScaler(enabled=AMP_ENABLED)
-
-    spec_l1 = nn.L1Loss()
-
-    # Schedules
-    delta_scale = DELTA_INIT
-    inst_noise_std = INST_NOISE_INIT
-    def step_schedules():
-        nonlocal delta_scale, inst_noise_std
-        delta_scale = max(DELTA_MIN, delta_scale * DELTA_DECAY)
-        inst_noise_std = max(INST_NOISE_MIN, inst_noise_std * INST_NOISE_DECAY)
-
-    # ASVspoof
-    keras_model = load_keras_safe()
-
-    # TB + CSV (rank 0 only)
-    tb_writer = None
-    if is_main_process() and SummaryWriter is not None:
-        tb_writer = SummaryWriter(str(tb_dir))
-    csv_path = save_dir / "train_log.csv"
-    csv_file = None
-    csv_writer = None
-    if is_main_process():
-        csv_file = open(csv_path, "w", newline="")
-        csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(["time","epoch","step","D","G","g_gan","g_spec","r1","lrG","lrD","delta","inst_noise"])
-        csv_file.flush()
+    # LR schedulers (ReduceLROnPlateau pe val loss G)
+    schedG = optim.lr_scheduler.ReduceLROnPlateau(optG, mode="min", factor=0.5, patience=2, verbose=True, min_lr=1e-6)
+    schedD = optim.lr_scheduler.ReduceLROnPlateau(optD, mode="min", factor=0.5, patience=2, verbose=True, min_lr=1e-6)
 
     # Early stopping
-    early = EarlyStopper(EARLY_STOP_PATIENCE, mode="min") if EARLY_STOP_ENABLED else None
-
-    mel2wav = MelToWave()
-
-    # ---------- checkpoint helpers (rank 0 only; best-only) ----------
-    def save_ckpt_best(tag: str):
-        if not is_main_process():
-            return
-        torch.save(ema.shadow.state_dict(), save_dir / f"G_ema_{tag}.pth")
-        torch.save(G.state_dict(),             save_dir / f"G_train_{tag}.pth")
-        torch.save(D.state_dict(),             save_dir / f"D_train_{tag}.pth")
-        torch.save({
-            "optG": optG.state_dict(),
-            "optD": optD.state_dict(),
-            "scalerG": scalerG.state_dict(),
-            "scalerD": scalerD.state_dict(),
-            "delta_scale": float(delta_scale),
-            "inst_noise_std": float(inst_noise_std),
-        }, save_dir / f"optim_{tag}.pth")
-
     best_val = float("inf")
     best_epoch = -1
+    no_improve = 0
 
-    step_global = 0
-    try:
-        for epoch in range(EPOCHS):
-            G.train(); D.train()
-            ep_lossD = ep_lossG = ep_g_gan = ep_g_spec = ep_r1 = 0.0
-            start_t = time.time()
+    # Schedules state
+    delta_scale = float(DELTA_INIT)
+    inst_sigma  = float(INST_NOISE_INIT)
 
-            for ib, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")):
-                wave = batch["wave"].to(device, non_blocking=False)  # [B,1,T]
-                mel  = logmel_from_wave(wave)    # [B,M,T]
+    # Data
+    train_ds = ASVBonafideDataset(split="train", use_validation=False)
+    val_ds   = ASVBonafideDataset(split="val",   use_validation=False)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=2, pin_memory=(device=="cuda"),
+                              collate_fn=pad_collate)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
+                            num_workers=2, pin_memory=(device=="cuda"),
+                            collate_fn=pad_collate)
 
-                # ---------- Update D ----------
-                for _ in range(CRITIC_ITERS):
-                    G.requires_grad_(False)
-                    D.requires_grad_(True)
-                    optD.zero_grad(set_to_none=True)
-                    with autocast(device_type=device.type, enabled=AMP_ENABLED):
-                        with torch.no_grad():
-                            delta = torch.tanh(G(mel)) * delta_scale
-                            mel_fake = _safe(mel + delta)
+    # Logs
+    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    csv_path = SAVE_DIR / "train_log.csv"
+    if not csv_path.exists():
+        with open(csv_path, "w", newline="") as f:
+            csv.writer(f).writerow([
+                "time","epoch","step","phase","lossD","lossG","g_gan","g_spec","r1",
+                "lrG","lrD","delta_scale","inst_sigma","evasion","val_evasion"
+            ])
 
-                        feats_real = feats_from_wave(wave)              # [B,C,T]
-                        feats_real.requires_grad_(True)
-                        feats_fake = feats_from_mel_no_wave(mel_fake)   # [B,C,T]
+    # hparams snapshot
+    write_hparams_json(SAVE_DIR / "hparams.json", {
+        "SR": SR, "N_MELS": N_MELS, "N_FFT": N_FFT, "HOP_LENGTH": HOP_LENGTH, "WIN_LENGTH": WIN_LENGTH,
+        "AMP_ENABLED": AMP_ENABLED, "BATCH_SIZE": BATCH_SIZE, "EPOCHS": EPOCHS, "CRITIC_ITERS": CRITIC_ITERS,
+        "LR_G": LR_G, "LR_D": LR_D, "BETA1": BETA1, "BETA2": BETA2,
+        "LAMBDA_GAN": LAMBDA_GAN, "LAMBDA_SPEC": LAMBDA_SPEC, "LAMBDA_R1": LAMBDA_R1,
+        "EVASION_LAMBDA": EVASION_LAMBDA, "EVASION_EVERY": EVASION_EVERY, "TARGET_LABEL": TARGET_LABEL,
+        "ASV_HEAD": asv_head,
+        "DELTA_INIT": DELTA_INIT, "DELTA_MIN": DELTA_MIN, "DELTA_DECAY": DELTA_DECAY,
+        "INST_NOISE_INIT": INST_NOISE_INIT, "INST_NOISE_MIN": INST_NOISE_MIN, "INST_NOISE_DECAY": INST_NOISE_DECAY,
+        "VAL_INTERVAL(steps)": VAL_INTERVAL,
+        "EARLY_STOP_METRIC": EARLY_STOP_METRIC
+    })
 
-                        feats_real_noisy = add_instance_noise(feats_real, inst_noise_std)
-                        feats_fake_noisy = add_instance_noise(feats_fake, inst_noise_std)
+    global_step = 0
+    next_val_step = VAL_INTERVAL  # validare pe pași
 
-                        d_real = D(feats_real_noisy)
-                        d_fake = D(feats_fake_noisy)
-                        lossD = wgan_d_loss(d_real, d_fake)
+    for epoch in range(EPOCHS):
+        G.train(); D.train()
 
-                    with torch.cuda.amp.autocast(enabled=False):
-                        r1 = r1_regularizer(d_real.float(), feats_real_noisy.float()) * LAMBDA_R1
-                        totalD = lossD + r1
+        # >>> Agregatori pe epocă (pentru linia "epoch" în CSV)
+        ep_lossD_sum = 0.0
+        ep_lossG_sum = 0.0
+        ep_g_gan_sum = 0.0
+        ep_g_spec_sum = 0.0
+        ep_r1_sum = 0.0
+        ep_evasion_sum = 0.0
+        ep_evasion_cnt = 0
+        ep_steps = 0
 
-                    scalerD.scale(totalD).backward()
-                    scalerD.step(optD)
-                    scalerD.update()
+        pbar = tqdm(enumerate(train_loader), total=len(train_loader))
+        for it, batch in pbar:
+            wave = batch["wave"].to(device)            # [B,1,T]
+            mel_real = logmel_from_wave(wave)          # [B,M,Tf]
 
-                    ep_lossD += float(lossD.detach().cpu())
-                    ep_r1    += float(r1.detach().cpu())
-                    step_schedules()
-                    step_global += 1
+            # --------- Update Critic (x CRITIC_ITERS) ----------
+            for _ in range(CRITIC_ITERS):
+                with autocast(device_type=("cuda" if device=="cuda" else "cpu"), enabled=AMP_ENABLED):
+                    # delta controlată de scală + tanh-clipping
+                    delta_raw = G(mel_real.detach())
+                    delta = torch.tanh(delta_raw) * delta_scale
+                    mel_fake = (mel_real.detach() + delta).clamp_min(-8.0)
 
-                # ---------- Update G ----------
-                G.requires_grad_(True)
-                D.requires_grad_(False)
-                optG.zero_grad(set_to_none=True)
-                with autocast(device_type=device.type, enabled=AMP_ENABLED):
-                    delta = torch.tanh(G(mel)) * delta_scale
-                    mel_fake = _safe(mel + delta)
-                    feats_fake = feats_from_mel_no_wave(mel_fake)
-                    d_fake = D(add_instance_noise(feats_fake, inst_noise_std))
-                    g_gan = wgan_g_loss(d_fake)
-                    g_spec = spec_l1(mel_fake, mel)
-                    evasion = torch.tensor(0.0, device=device, dtype=mel.dtype)
-                    if keras_model is not None and EVASION_LAMBDA > 0.0 and (EVASION_EVERY <= 1 or (step_global % EVASION_EVERY) == 0):
-                        evasion = asv_evasion_penalty(keras_model, mel_fake)
-                    lossG = LAMBDA_GAN * g_gan + LAMBDA_SPEC * g_spec + EVASION_LAMBDA * evasion
+                    # instance noise simetric pe intrarea lui D
+                    if inst_sigma > 0.0:
+                        noise_r = torch.randn_like(mel_real) * inst_sigma
+                        noise_f = torch.randn_like(mel_fake) * inst_sigma
+                        d_real = D(mel_real + noise_r)
+                        d_fake = D(mel_fake.detach() + noise_f)
+                    else:
+                        d_real = D(mel_real)
+                        d_fake = D(mel_fake.detach())
 
-                scalerG.scale(lossG).backward()
-                scalerG.step(optG)
-                scalerG.update()
-                ema.update(G)
+                    lossD = wgan_d_loss(d_real, d_fake)
 
-                ep_lossG += float(lossG.detach().cpu())
-                ep_g_gan += float(g_gan.detach().cpu())
-                ep_g_spec += float(g_spec.detach().cpu())
+                optD.zero_grad(set_to_none=True)
+                scaler.scale(lossD).backward()
 
-                # ---------- Logging ----------
-                if is_main_process() and (ib + 1) % LOG_INTERVAL == 0:
-                    lrG = optG.param_groups[0]["lr"]
-                    lrD = optD.param_groups[0]["lr"]
-                    print(
-                        f"[ep {epoch}] step {ib+1:4d}  D={ep_lossD/(ib+1):.3f}  G={ep_lossG/(ib+1):.3f}  "
-                        f"g_gan={ep_g_gan/(ib+1):.3f}  g_spec={ep_g_spec/(ib+1):.3f}  r1={ep_r1/(ib+1):.3f}  "
-                        f"Δ={delta_scale:.4f}  σ={inst_noise_std:.3f}"
-                    )
-                    if csv_writer is not None:
-                        csv_writer.writerow([int(time.time()), epoch, ib+1,
-                                             f"{ep_lossD/(ib+1):.6f}", f"{ep_lossG/(ib+1):.6f}",
-                                             f"{ep_g_gan/(ib+1):.6f}", f"{ep_g_spec/(ib+1):.6f}",
-                                             f"{ep_r1/(ib+1):.6f}",
-                                             f"{lrG:.6f}", f"{lrD:.6f}",
-                                             f"{delta_scale:.6f}", f"{inst_noise_std:.6f}"])
-                        csv_file.flush()  # type: ignore
-                    if tb_writer is not None:
-                        tb_writer.add_scalar("train/D", ep_lossD/(ib+1), step_global)
-                        tb_writer.add_scalar("train/G", ep_lossG/(ib+1), step_global)
-                        tb_writer.add_scalar("train/g_gan", ep_g_gan/(ib+1), step_global)
-                        tb_writer.add_scalar("train/g_spec", ep_g_spec/(ib+1), step_global)
-                        tb_writer.add_scalar("train/r1", ep_r1/(ib+1), step_global)
-                        tb_writer.add_scalar("train/delta_scale", delta_scale, step_global)
-                        tb_writer.add_scalar("train/inst_noise", inst_noise_std, step_global)
+                # R1 pe real — fără autocast, cu requires_grad=True
+                with autocast(device_type=("cuda" if device=="cuda" else "cpu"), enabled=False):
+                    mel_real_r1 = mel_real.detach().requires_grad_(True)
+                    d_real_r1 = D(mel_real_r1)
+                    r1 = r1_regularizer(d_real_r1, mel_real_r1)
+                scaler.scale(LAMBDA_R1 * r1).backward()
 
-            # ----------------- VALIDARE PE EPOCĂ -----------------
-            G.eval()
-            val_spec_sum, val_n = 0.0, 0
-            with torch.no_grad():
-                for vb in val_loader:
-                    vw = vb["wave"].to(device).float()
-                    vm = logmel_from_wave(vw)
-                    delta = torch.tanh(ema.shadow(vm)) * delta_scale
-                    vm_fake = _safe(vm + delta)
-                    val_spec_sum += float(nn.functional.l1_loss(vm_fake, vm).detach().cpu())
-                    val_n += 1
-            val_spec = val_spec_sum / max(1, val_n)
-            dur = time.time() - start_t
+                scaler.step(optD)
+                scaler.update()  # update și după D
 
-            if is_main_process():
-                print(f"[VAL] epoch {epoch+1}/{EPOCHS}  val_spec={val_spec:.4f}  time={dur/60.0:.1f}min")
-                if tb_writer is not None:
-                    tb_writer.add_scalar("val/spec_l1", val_spec, epoch+1)
-                    tb_writer.add_scalar("epoch/delta_scale", delta_scale, epoch+1)
-                    tb_writer.add_scalar("epoch/inst_noise", inst_noise_std, epoch+1)
-                    tb_writer.add_scalar("epoch/lrG", optG.param_groups[0]['lr'], epoch+1)
-                    tb_writer.add_scalar("epoch/lrD", optD.param_groups[0]['lr'], epoch+1)
-                    tb_writer.add_scalar("epoch/g_gan", ep_g_gan / max(1, ib+1), epoch+1)
-                    tb_writer.add_scalar("epoch/g_spec", ep_g_spec / max(1, ib+1), epoch+1)
-                    tb_writer.add_scalar("epoch/r1", ep_r1 / max(1, ib+1), epoch+1)
+            # --------- Update Generator ----------
+            with autocast(device_type=("cuda" if device=="cuda" else "cpu"), enabled=AMP_ENABLED):
+                delta_raw = G(mel_real)                                  # [B,M,Tf]
+                delta = torch.tanh(delta_raw) * delta_scale
+                mel_fake = (mel_real + delta).clamp_min(-8.0)
+                d_fake = D(mel_fake)
+                g_gan = wgan_g_loss(d_fake) * LAMBDA_GAN
+                g_spec = spec_l1(mel_fake, mel_real) * LAMBDA_SPEC
+                lossG = g_gan + g_spec
 
-            # ---------- BEST-ONLY ----------
-            if val_spec < best_val:
-                best_val = val_spec
-                best_epoch = epoch + 1
+            # === Evasion loss (ASVspoof mandatory) ===
+            evasion_mean = np.nan
+            if EVASION_LAMBDA > 0.0 and (global_step % EVASION_EVERY) == 0:
+                with torch.no_grad():
+                    wave_fake = mel2wav(mel_fake)                     # [B,1,T]
+                    asv_vec = make_asv_vector_from_wave(wave_fake)    # [B,61]
+                x_np = asv_vec.detach().cpu().numpy().astype("float32")
+                x_np = asv_scaler.transform(x_np)
+                preds = keras_model.predict(x_np, verbose=0)          # [B,C]
+                if preds.ndim != 2:
+                    raise RuntimeError(f"[ASV] Pred shape invalid: {preds.shape}")
 
-                save_ckpt_best("best")
+                if asv_head == "softmax":
+                    probs = softmax(preds, axis=1)
+                    p_target_np = probs[:, target_idx]
+                else:  # sigmoid
+                    p_sig = preds[:, 0].astype("float32")  # P(labels[1])
+                    p_target_np = p_sig if sigmoid_mapping == "target_is_pos" else (1.0 - p_sig)
 
-                if is_main_process():
-                    with torch.no_grad():
+                evasion_mean = float(p_target_np.mean())
+                evasion_loss = torch.tensor(evasion_mean, dtype=torch.float32, device=device)
+                lossG = lossG + (EVASION_LAMBDA * evasion_loss)
+
+                # >>> agregare pe epocă (doar când e calculată)
+                ep_evasion_sum += evasion_mean
+                ep_evasion_cnt += 1
+
+            optG.zero_grad(set_to_none=True)
+            scaler.scale(lossG).backward()
+            scaler.step(optG)
+            scaler.update()
+
+            # ---- annealing schedules ----
+            delta_scale = max(DELTA_MIN, delta_scale * DELTA_DECAY)
+            inst_sigma  = max(INST_NOISE_MIN, inst_sigma * INST_NOISE_DECAY)
+
+            # >>> agregare pe epocă (medii)
+            ep_lossD_sum += float(lossD.detach().cpu())
+            ep_lossG_sum += float(lossG.detach().cpu())
+            ep_g_gan_sum += float(g_gan.detach().cpu())
+            ep_g_spec_sum += float(g_spec.detach().cpu())
+            ep_r1_sum    += float(r1.detach().cpu())
+            ep_steps     += 1
+
+            # Logs (pe pași)
+            if (global_step % LOG_INTERVAL) == 0:
+                with open(csv_path, "a", newline="") as f:
+                    csv.writer(f).writerow([
+                        int(time.time()), epoch, global_step, "train",
+                        float(lossD.detach().cpu()), float(lossG.detach().cpu()),
+                        float(g_gan.detach().cpu()), float(g_spec.detach().cpu()),
+                        float(r1.detach().cpu()),
+                        optG.param_groups[0]["lr"], optD.param_groups[0]["lr"],
+                        delta_scale, inst_sigma, evasion_mean, np.nan
+                    ])
+                pbar.set_description(
+                    f"E{epoch} S{global_step} | D {lossD:.3f} | G {lossG:.3f} | gg {g_gan:.3f} | gs {g_spec:.3f} | r1 {r1:.3f} | δ {delta_scale:.4f} σ {inst_sigma:.3f} | ev {evasion_mean if not np.isnan(evasion_mean) else -1:.3f}"
+                )
+
+            # --------- Validare pe PAȘI (opțional) ----------
+            if global_step > 0 and global_step >= next_val_step:
+                G.eval(); D.eval()
+                with torch.no_grad():
+                    val_ok = False
+                    try:
+                        batch_val = next(iter(val_loader))
+                        val_ok = True
+                    except StopIteration:
+                        # dataset val gol — ignorăm validarea pe pași
+                        val_ok = False
+
+                    if val_ok:
+                        wave_val = batch_val["wave"].to(device)
+                        mel_real_v = logmel_from_wave(wave_val)
+                        delta_v = torch.tanh(G(mel_real_v)) * delta_scale
+                        mel_fake_v = (mel_real_v + delta_v).clamp_min(-8.0)
+                        d_fake_v = D(mel_fake_v)
+                        g_gan_v = -d_fake_v.mean()
+                        g_spec_v = F.l1_loss(mel_fake_v, mel_real_v)
+                        lossG_val = (g_gan_v * LAMBDA_GAN) + (g_spec_v * LAMBDA_SPEC)
+
+                        # ASV metric pe VAL
+                        val_evasion = np.nan
                         try:
-                            vb0 = next(iter(val_loader))
-                            wave_dbg = vb0["wave"][:2].to(device)
+                            wave_fake_v = mel2wav(mel_fake_v)
+                            asv_vec_v = make_asv_vector_from_wave(wave_fake_v)
+                            x_np_v = asv_vec_v.detach().cpu().numpy().astype("float32")
+                            x_np_v = asv_scaler.transform(x_np_v)
+                            preds_v = keras_model.predict(x_np_v, verbose=0)
+                            if preds_v.ndim == 2:
+                                if asv_head == "softmax":
+                                    probs_v = softmax(preds_v, axis=1)
+                                    p_target_v = probs_v[:, target_idx]
+                                else:
+                                    p_sig_v = preds_v[:, 0].astype("float32")
+                                    p_target_v = p_sig_v if sigmoid_mapping == "target_is_pos" else (1.0 - p_sig_v)
+                                val_evasion = float(p_target_v.mean())
                         except Exception:
-                            wave_dbg = torch.randn(2, 1, int(1.0 * SR), device=device)
-                        mel_dbg = logmel_from_wave(wave_dbg)
-                        delta_dbg = torch.tanh(ema.shadow(mel_dbg)) * delta_scale
-                        mel_fake_dbg = _safe(mel_dbg + delta_dbg)
-                        wav_fake = mel2wav(mel_fake_dbg)
-                        for i in range(min(wav_fake.size(0), 2)):
-                            wf = wav_fake[i].detach().cpu().unsqueeze(0).clamp_(-1.0, 1.0)
-                            outp = samples_dir / f"best_ep{best_epoch:03d}_{i}.wav"
-                            try:
-                                torchaudio.save(str(outp), wf, SR)
-                            except Exception as e:
-                                print(f"[WARN] nu pot salva {outp}: {e}")
-                    print(f"[BEST] ep={best_epoch}  val_spec={best_val:.4f}  -> checkpoint + samples salvate în {save_dir}")
+                            val_evasion = np.nan
 
-            # ---------- Early stop ----------
-            if EARLY_STOP_ENABLED and early is not None and early.step(val_spec):
-                if is_main_process():
-                    print(f"[EarlyStop] Stop la epoca {epoch+1}. Best val_spec={early.best:.4f} @ epoca {best_epoch}")
-                break
+                        # log val
+                        with open(csv_path, "a", newline="") as f:
+                            csv.writer(f).writerow([
+                                int(time.time()), epoch, global_step, "val",
+                                np.nan, float(lossG_val.cpu()), float(g_gan_v.cpu()), float(g_spec_v.cpu()),
+                                np.nan, optG.param_groups[0]["lr"], optD.param_groups[0]["lr"],
+                                delta_scale, inst_sigma, np.nan, val_evasion
+                            ])
 
-    except KeyboardInterrupt:
-        if is_main_process():
-            print("\n[CTRL-C] Oprit de utilizator.")
-    finally:
-        if is_main_process():
-            print(f"Training încheiat. Best @ epoca {best_epoch} cu val_spec={best_val:.4f}. Checkpoints & samples în: {save_dir}")
+                        # samples audio (și pe pași)
+                        samples_dir = SAVE_DIR / "samples" / f"step{global_step:07d}"
+                        with torch.no_grad():
+                            wave_fake_v = mel2wav(mel_fake_v)  # [B,1,T]
+                            save_audio_batch(samples_dir, wave_fake_v, SR, max_items=4, tag="fake")
+                            save_audio_batch(samples_dir, wave_val,    SR, max_items=4, tag="real")
 
-            # Plot-uri din CSV
+                        # checkpoint pe val-step
+                        save_checkpoint({
+                            "epoch": epoch, "step": global_step,
+                            "G": G.state_dict(), "D": D.state_dict(),
+                            "optG": optG.state_dict(), "optD": optD.state_dict(),
+                        }, name=f"step{global_step:07d}.pth")
+
+                        # reducere LR pe platou (după lossG_val)
+                        schedG.step(lossG_val)
+                        schedD.step(lossG_val)
+
+                        print(f"[VAL@step] step={global_step} epoch={epoch} "
+                              f"lossG_val={lossG_val:.6f} g_spec={g_spec_v:.6f} "
+                              f"val_evasion={val_evasion if not np.isnan(val_evasion) else float('nan'):.4f}")
+
+                # programează următoarea validare
+                next_val_step += VAL_INTERVAL
+
+            # checkpointuri periodice ușoare (opțional)
+            if (global_step % (LOG_INTERVAL * 10)) == 0 and global_step > 0:
+                save_checkpoint({
+                    "epoch": epoch, "step": global_step,
+                    "G": G.state_dict(), "D": D.state_dict(),
+                    "optG": optG.state_dict(), "optD": optD.state_dict(),
+                }, name=f"optim_step{global_step:07d}.pth")
+
+            global_step += 1
+
+        # --------- MOSTRE + METRICE LA FIECARE EPOCĂ ----------
+        G.eval(); D.eval()
+
+        # medii pe epocă
+        ep_lossD = ep_lossD_sum / max(1, ep_steps)
+        ep_lossG = ep_lossG_sum / max(1, ep_steps)
+        ep_g_gan = ep_g_gan_sum / max(1, ep_steps)
+        ep_g_spec = ep_g_spec_sum / max(1, ep_steps)
+        ep_r1     = ep_r1_sum    / max(1, ep_steps)
+        ep_evasion = (ep_evasion_sum / ep_evasion_cnt) if ep_evasion_cnt > 0 else np.nan
+
+        # scriem linia „epoch” în CSV
+        with open(csv_path, "a", newline="") as f:
+            csv.writer(f).writerow([
+                int(time.time()), epoch, global_step, "epoch",
+                ep_lossD, ep_lossG, ep_g_gan, ep_g_spec, ep_r1,
+                optG.param_groups[0]["lr"], optD.param_groups[0]["lr"],
+                delta_scale, inst_sigma, ep_evasion, np.nan
+            ])
+
+        # mostre audio (always per-epoch)
+        with torch.no_grad():
+            # luăm un batch din val; dacă nu există, din train
+            have_val = True
             try:
-                import matplotlib
-                matplotlib.use("Agg")
-                import matplotlib.pyplot as plt
-                import pandas as pd
+                batch_val = next(iter(val_loader))
+            except StopIteration:
+                have_val = False
 
-                df = pd.read_csv(save_dir / "train_log.csv")
-                x = np.arange(len(df))
+            batch_src = batch_val if have_val else next(iter(train_loader))
+            wave_src = batch_src["wave"].to(device)
 
-                (save_dir / "plots").mkdir(parents=True, exist_ok=True)
+            mel_real_ep = logmel_from_wave(wave_src)
+            delta_ep = torch.tanh(G(mel_real_ep)) * delta_scale
+            mel_fake_ep = (mel_real_ep + delta_ep).clamp_min(-8.0)
+            wave_fake_ep = mel2wav(mel_fake_ep)
+            samples_dir_ep = SAVE_DIR / "samples" / f"epoch{epoch:04d}"
+            save_audio_batch(samples_dir_ep, wave_fake_ep, SR, max_items=4, tag="fake")
+            save_audio_batch(samples_dir_ep, wave_src,     SR, max_items=4, tag="real")
 
-                def _plot_one(ycols, title, fname):
-                    plt.figure()
-                    for col in ycols:
-                        if col in df.columns:
-                            plt.plot(x, df[col], label=col)
-                    plt.title(title)
-                    plt.xlabel("log step")
-                    plt.ylabel(title)
-                    plt.legend()
-                    plt.tight_layout()
-                    out = (save_dir / "plots" / fname)
-                    plt.savefig(out)
-                    plt.close()
-                    print(f"[PLOT] {out}")
+        # --------- VALIDARE LA SFÂRȘIT DE EPOCĂ + BEST ---------
+        lossG_val_epoch = None
+        g_spec_v_epoch = None
+        val_evasion_epoch = np.nan
 
-                _plot_one(["D","G"], "Loss D/G", "loss_DG.png")
-                _plot_one(["g_gan","g_spec","r1"], "GAN/Spec/R1", "components.png")
-                _plot_one(["delta","inst_noise"], "Schedules", "schedules.png")
-                _plot_one(["lrG","lrD"], "Learning Rates", "lrs.png")
-
-            except Exception as e:
-                print(f"[WARN] Plotting a eșuat: {e}")
-
+        with torch.no_grad():
+            val_ok = True
             try:
-                if 'csv_file' in locals() and csv_file is not None:
-                    csv_file.flush()
-                    csv_file.close()
-            except Exception:
-                pass
-            try:
-                if 'tb_writer' in locals() and tb_writer is not None:
-                    tb_writer.flush()
-                    tb_writer.close()
-            except Exception:
-                pass
+                batch_val = next(iter(val_loader))
+            except StopIteration:
+                val_ok = False
+
+            if val_ok:
+                wave_val = batch_val["wave"].to(device)
+                mel_real_v = logmel_from_wave(wave_val)
+                delta_v = torch.tanh(G(mel_real_v)) * delta_scale
+                mel_fake_v = (mel_real_v + delta_v).clamp_min(-8.0)
+                d_fake_v = D(mel_fake_v)
+                g_gan_v = -d_fake_v.mean()
+                g_spec_v = F.l1_loss(mel_fake_v, mel_real_v)
+                lossG_val = (g_gan_v * LAMBDA_GAN) + (g_spec_v * LAMBDA_SPEC)
+
+                # ASV metric
+                try:
+                    wave_fake_v = mel2wav(mel_fake_v)
+                    asv_vec_v = make_asv_vector_from_wave(wave_fake_v)
+                    x_np_v = asv_vec_v.detach().cpu().numpy().astype("float32")
+                    x_np_v = asv_scaler.transform(x_np_v)
+                    preds_v = keras_model.predict(x_np_v, verbose=0)
+                    if preds_v.ndim == 2:
+                        if asv_head == "softmax":
+                            probs_v = softmax(preds_v, axis=1)
+                            p_target_v = probs_v[:, target_idx]
+                        else:
+                            p_sig_v = preds_v[:, 0].astype("float32")
+                            p_target_v = p_sig_v if sigmoid_mapping == "target_is_pos" else (1.0 - p_sig_v)
+                        val_evasion_epoch = float(p_target_v.mean())
+                except Exception:
+                    val_evasion_epoch = np.nan
+
+                lossG_val_epoch = float(lossG_val.cpu())
+                g_spec_v_epoch = float(g_spec_v.cpu())
+
+                # log „val_end”
+                with open(csv_path, "a", newline="") as f:
+                    csv.writer(f).writerow([
+                        int(time.time()), epoch, global_step, "val_end",
+                        np.nan, lossG_val_epoch, float(g_gan_v.cpu()), g_spec_v_epoch,
+                        np.nan, optG.param_groups[0]["lr"], optD.param_groups[0]["lr"],
+                        delta_scale, inst_sigma, np.nan, val_evasion_epoch
+                    ])
+
+        # alegem metrica pentru „best”
+        if lossG_val_epoch is not None:
+            metric_val = g_spec_v_epoch if EARLY_STOP_METRIC == "val_spec" else lossG_val_epoch
+        else:
+            # fallback: fără val — folosim media pe epocă
+            metric_val = ep_g_spec if EARLY_STOP_METRIC == "val_spec" else ep_lossG
+
+        improved = metric_val < (best_val - 1e-6)
+        if improved:
+            best_val = metric_val
+            best_epoch = epoch
+            no_improve = 0
+            save_checkpoint({
+                "epoch": epoch, "step": global_step,
+                "G": G.state_dict(), "D": D.state_dict(),
+                "optG": optG.state_dict(), "optD": optD.state_dict(),
+            }, name=f"best.pth")
+        else:
+            no_improve += 1
+
+        # reducere LR pe platou pe baza lossG_val_epoch dacă există, altfel pe media epocii
+        if lossG_val_epoch is not None:
+            schedG.step(lossG_val_epoch)
+            schedD.step(lossG_val_epoch)
+            print(f"[VAL@end] epoch={epoch} lossG_val={lossG_val_epoch:.6f} best={best_val:.6f} @epoch {best_epoch} val_evasion={val_evasion_epoch if not np.isnan(val_evasion_epoch) else float('nan'):.4f}")
+        else:
+            schedG.step(ep_lossG)
+            schedD.step(ep_lossG)
+            print(f"[VAL@end] epoch={epoch} (no val) train_lossG={ep_lossG:.6f} best={best_val:.6f} @epoch {best_epoch}")
+
+        # early stopping (numără epoci, nu doar validări pe pași)
+        if EARLY_STOP_ENABLED and no_improve >= EARLY_STOP_PATIENCE:
+            print(f"[EarlyStopping] Fără îmbunătățire {EARLY_STOP_PATIENCE} epoci. Oprim.")
+            print("Training done.")
+            return
+
+    print("Training done.")
 
 if __name__ == "__main__":
     main()
