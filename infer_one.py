@@ -1,4 +1,4 @@
-# infer_one.py — consistent with train.py (mel-in Generator), robust ckpt loader
+# infer_one.py — consistent cu train.py (mel-in Generator), robust ckpt loader (best.pth)
 from __future__ import annotations
 import argparse, random
 from pathlib import Path
@@ -13,7 +13,8 @@ from constants import (
 )
 from models import Generator
 
-# ----------------- Mel pipeline (same as train.py) -----------------
+
+# ----------------- Mel pipeline (identic ca la antrenare) -----------------
 _mel = torchaudio.transforms.MelSpectrogram(
     sample_rate=SR,
     n_fft=N_FFT,
@@ -22,7 +23,7 @@ _mel = torchaudio.transforms.MelSpectrogram(
     n_mels=N_MELS,
     center=True,
     pad_mode="reflect",
-    power=1.0,        # magnitude
+    power=1.0,        # magnitudine
     norm="slaney",
     mel_scale="htk",
 )
@@ -33,14 +34,15 @@ def _safe(x: torch.Tensor) -> torch.Tensor:
 @torch.no_grad()
 def logmel_from_wave(wave: torch.Tensor) -> torch.Tensor:
     """
-    wave: [B, 1, T] float32 in [-1,1]
+    wave: [B, 1, T] float32 în [-1,1]
     return: log1p(mel) în [B, N_MELS, T']
     """
     mel = _mel.to(wave.device)(wave.squeeze(1))  # [B, M, T]
     mel = torch.log1p(mel).clamp(-8.0, 8.0)
     return _safe(mel)
 
-# ----------------- Mel->Wave reconstructor (same as train.py) -----------------
+
+# ----------------- Mel->Wave reconstructor (ca în train.py) -----------------
 class MelToWave(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -66,6 +68,7 @@ class MelToWave(torch.nn.Module):
         wave = self.griffin(spec)         # [B, T]
         return wave
 
+
 # ----------------- Utilities -----------------
 def pick_random_audio(data_dir: Path) -> Path:
     exts = {".wav", ".flac", ".mp3", ".m4a"}
@@ -74,56 +77,115 @@ def pick_random_audio(data_dir: Path) -> Path:
         raise RuntimeError(f"Nu am găsit fișiere audio în {data_dir}")
     return random.choice(files)
 
-def find_latest_ema_ckpt() -> Path:
-    # Preferă EMA; cade pe G_train_* dacă nu există EMA
-    ema = sorted(SAVE_DIR.glob("D_train_best.pth"))
-    if ema:
-        return ema[-1]
-    gtrain = sorted(SAVE_DIR.glob("G_train_*.pth"))
-    if gtrain:
-        return gtrain[-1]
-    raise FileNotFoundError(f"Nu există checkpoint-uri în {SAVE_DIR}. Rulează train.py mai întâi.")
+def _checkpoints_dir() -> Path:
+    """
+    Folosește cu prioritate {ROOT}/checkpoints dacă există;
+    altfel cade pe SAVE_DIR, apoi pe ROOT/'checkpoints'.
+    """
+    # 1) root/checkpoints
+    root_ckpt = Path(ROOT) / "checkpoints"
+    if root_ckpt.exists():
+        return root_ckpt
+    # 2) SAVE_DIR (dacă proiectul salvează acolo)
+    if Path(SAVE_DIR).exists():
+        return Path(SAVE_DIR)
+    # 3) fallback
+    return root_ckpt
+
+def find_best_ckpt() -> Path:
+    """
+    Caută explicit 'best.pth' în directorul de checkpoint-uri.
+    Dacă nu există, încearcă câteva denumiri comune.
+    """
+    cdir = _checkpoints_dir()
+    # preferat: best.pth
+    preferred = cdir / "best.pth"
+    if preferred.exists():
+        return preferred
+
+    # alte denumiri uzuale
+    candidates = []
+    patterns = [
+        "G_ema_best.pth",
+        "generator_ema_best.pth",
+        "G_best.pth",
+        "generator_best.pth",
+        "ema_best.pth",
+        "D_train_best.pth",      # dacă doar acesta există
+        "G_train_best.pth",
+        "G_train_*.pth",         # ultimul ca fallback
+        "optim_step*.pth",       # ultimul ca fallback (dar risc de non-state_dict)
+    ]
+    for pat in patterns:
+        found = sorted(cdir.glob(pat))
+        candidates.extend(found)
+
+    if candidates:
+        return candidates[-1]
+
+    raise FileNotFoundError(
+        f"Nu am găsit niciun checkpoint în {cdir}. Așteptam 'best.pth'."
+    )
 
 def load_state_dict_flex(path: Path, device: str):
     """
-    Acceptă:
-      - raw state_dict (mapăstr->tensor)
+    Acceptă formate variate:
+      - raw state_dict (mapă str->tensor)
       - {'state_dict': ...}
-      - {'model': ...}
+      - {'model': ...}, {'ema': ...}, {'G': ...}, {'generator': ...}, {'netG': ...}
     """
     obj = torch.load(path, map_location=device)
+
+    # dict cu chei comune
     if isinstance(obj, dict):
-        # try common keys
-        for k in ("state_dict", "model", "ema", "G", "generator"):
+        for k in ("state_dict", "model", "ema", "G", "generator", "netG"):
             if k in obj and isinstance(obj[k], dict):
                 return obj[k]
-        # might itself be a raw state_dict (all tensors)
-        # heuristic: check that values look like tensors
+
+        # dacă toate valorile sunt tensori, probabil e chiar un state_dict
         vals = list(obj.values())
         if vals and all(isinstance(v, torch.Tensor) for v in vals):
             return obj
-        # some checkpoints saved via torch.save(ema.shadow.state_dict())
-        # already handled above; else raise
+
+        # unele checkpoint-uri pot salva direct shadow.state_dict() (tot dict de tensori)
+        # dacă nu e nimic potrivit:
         raise KeyError(
             f"Nu am găsit un 'state_dict' valid în {path}. Chei: {list(obj.keys())}"
         )
-    elif isinstance(obj, (list, tuple)):
-        raise KeyError("Checkpoint-ul pare list/tuple, nu un state_dict dict.")
-    else:
-        # Some odd formats can still be an OrderedDict-like
-        try:
-            # Check it behaves like a mapping of tensors
-            _ = [k for k in obj.keys()]  # type: ignore
-            return obj
-        except Exception:
-            raise KeyError("Format necunoscut pentru checkpoint (nu pot extrage state_dict).")
+
+    # OrderedDict-like?
+    try:
+        _ = list(obj.keys())  # type: ignore
+        return obj
+    except Exception:
+        raise KeyError("Format necunoscut pentru checkpoint (nu pot extrage state_dict).")
+
+def read_audio_mono(path: Path) -> tuple[torch.Tensor, int]:
+    """
+    Citește fișierul audio, face mono (medie pe canale), întoarce [1, T] float32 și sr.
+    """
+    try:
+        wav_np, sr = sf.read(str(path), dtype="float32", always_2d=False)
+    except TypeError:
+        # compat pentru versiuni libsndfile mai vechi
+        wav_np, sr = sf.read(str(path), dtype="float32")
+    if isinstance(wav_np, list):
+        wav_np = np.array(wav_np, dtype="float32")
+    if wav_np.ndim == 2:
+        wav_np = wav_np.mean(axis=1)
+    wave = torch.from_numpy(wav_np).view(1, -1)  # [1, T]
+    return wave, sr
+
 
 # ----------------- Main -----------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", type=str, default=None, help="Calea către un checkpoint .pth (dacă omis, ia cel mai nou EMA).")
-    parser.add_argument("--input", type=str, default=None, help="Fișier audio de test (altfel alege random din DATA_DIR).")
-    parser.add_argument("--delta_scale", type=float, default=0.05, help="La fel ca în train.py (tanh * delta_scale).")
+    parser.add_argument("--ckpt", type=str, default=None,
+                        help="Cale către un checkpoint .pth (implicit: checkpoints/best.pth).")
+    parser.add_argument("--input", type=str, default=None,
+                        help="Fișier audio de test (altfel random din DATA_DIR).")
+    parser.add_argument("--delta_scale", type=float, default=0.05,
+                        help="La fel ca în train.py (tanh * delta_scale).")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -133,20 +195,17 @@ def main():
     print(f"[infer] input = {in_path}")
 
     # 2) Încarcă audio (mono, resample la SR)
-    wav_np, sr = sf.read(str(in_path), dtype="float32", always_2d=False)
-    if wav_np.ndim == 2:
-        wav_np = wav_np.mean(axis=1)
-    wave = torch.from_numpy(wav_np).view(1, -1)  # [1, T]
+    wave, sr = read_audio_mono(in_path)
     if sr != SR:
         wave = torchaudio.functional.resample(wave, sr, SR)
     wave = wave.clamp(-1.0, 1.0).to(device)
-    wave = wave.unsqueeze(1)  # [1,1,T] — pentru logmel funcția noastră
+    wave = wave.unsqueeze(1)  # [1,1,T] — pentru logmel
 
     # 3) Log-mel ca la antrenare
     mel = logmel_from_wave(wave)  # [1, N_MELS, T']
 
     # 4) Încarcă checkpoint (Generator primește N_MELS canale)
-    ckpt_path = Path(args.ckpt) if args.ckpt else find_latest_ema_ckpt()
+    ckpt_path = Path(args.ckpt) if args.ckpt else find_best_ckpt()
     print(f"[infer] ckpt  = {ckpt_path.name}")
     state_dict = load_state_dict_flex(ckpt_path, device)
 
