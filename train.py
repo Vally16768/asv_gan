@@ -10,6 +10,15 @@ from torch import nn, optim
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 import torchaudio
+import multiprocessing as mp
+
+# ----------------- Setări robuste la pornire (înainte de DataLoader/TF) -----------------
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
+
+torch.set_float32_matmul_precision("high")
 
 # ----------------- Imports proiect -----------------
 from constants import (
@@ -35,10 +44,16 @@ from models import Generator, Critic
 from losses import wgan_g_loss, wgan_d_loss, r1_regularizer
 from utils import EMA
 
-# ---------- rank helpers (torchrun-safe) ----------
+# ---------- rank/helpers (torchrun-safe) ----------
 def get_rank() -> int:
     try:
         return int(os.environ.get("RANK", "0"))
+    except Exception:
+        return 0
+
+def get_local_rank() -> int:
+    try:
+        return int(os.environ.get("LOCAL_RANK", "0"))
     except Exception:
         return 0
 
@@ -183,11 +198,32 @@ except Exception:
 
 def load_keras_safe() -> Optional[object]:
     try:
+        # ————— Reduce drastic log-urile TF —————
+        os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")   # 0=ALL, 1=INFO, 2=WARNING, 3=ERROR
+        os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")  # oprește mesajele oneDNN
+
+        import tensorflow as tf
+        try:
+            # Nu lăsăm TF să vadă GPU-urile -> nu mai încearcă cuDNN/cuBLAS/TRT
+            tf.config.set_visible_devices([], "GPU")
+            # Închidem loggerul TF
+            tf.get_logger().setLevel("ERROR")
+        except Exception:
+            pass
+
+        # (opțional) reducere și pentru absl
+        try:
+            import absl.logging
+            absl.logging.set_verbosity(absl.logging.ERROR)
+        except Exception:
+            pass
+
         from detector_keras import load_keras_model
+
         for name in ("best_model.keras", "best_model.h5"):
             p = ASV_MODEL_DIR / name
             if p.exists():
-                return load_keras_model(p)
+                return load_keras_model(p)  # va rula pe CPU, silențios
     except Exception:
         pass
     return None
@@ -220,7 +256,7 @@ class EarlyStopper:
     def __init__(self, patience: int, mode: str = "min"):
         self.patience = patience
         self.mode = mode
-        self.best = None
+        self.best: Optional[float] = None
         self.bad_epochs = 0
 
     def step(self, value: float) -> bool:
@@ -236,18 +272,39 @@ class EarlyStopper:
         return self.bad_epochs > self.patience
 
 # ============================================================
+# ================   Collate (nivel de modul!)  ==============
+# ============================================================
+
+def collate_pad(batch):
+    # batch: listă de dict-uri cu {'wave': [1,T]}
+    waves = [b["wave"] for b in batch if b is not None]
+    if len(waves) == 0:
+        T = int(0.5 * SR)
+        waves = [torch.zeros(1, T) for _ in range(1)]
+    maxT = max(w.shape[-1] for w in waves)
+    waves = [torch.nn.functional.pad(w, (0, maxT - w.shape[-1])) for w in waves]
+    waves = torch.stack(waves, dim=0).float()  # [B,1,T]
+    return {"wave": waves}
+
+# ============================================================
 # ================           main()            ===============
 # ============================================================
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Selecție corectă GPU pe proces
+    if torch.cuda.is_available():
+        local_rank = get_local_rank()
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        torch.backends.cudnn.benchmark = True
+    else:
+        device = torch.device("cpu")
 
     # ----------------- I/O dirs (rank 0) -----------------
-    # Dacă SAVE_DIR e relativ -> ROOT/SAVE_DIR; dacă este absolut -> îl folosim ca atare.
     base_save = Path(SAVE_DIR)
     if not base_save.is_absolute():
         base_save = Path(ROOT) / base_save
-    save_dir = base_save  # ar trebui să fie checkpoints/
+    save_dir = base_save  # ex: checkpoints/
     samples_dir = save_dir / "samples"
     tb_dir = save_dir / "tb"
     plots_dir = save_dir / "plots"
@@ -260,15 +317,33 @@ def main():
     train_set = ASVBonafideDataset(split="train")
     val_set   = ASVBonafideDataset(split="val")
 
-    def _collate(batch):
-        waves = [b["wave"] for b in batch]
-        maxT = max(w.shape[-1] for w in waves)
-        waves = [torch.nn.functional.pad(w, (0, maxT - w.shape[-1])) for w in waves]
-        waves = torch.stack(waves, dim=0).float()  # [B,1,T]
-        return {"wave": waves}
+    # Parametri conservatori per-proces (poți crește după ce e stabil)
+    train_workers = int(os.environ.get("TRAIN_WORKERS", "1"))
+    val_workers   = int(os.environ.get("VAL_WORKERS", "0"))
 
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, collate_fn=_collate, drop_last=True)
-    val_loader   = DataLoader(val_set,   batch_size=BATCH_SIZE, shuffle=False, num_workers=2, collate_fn=_collate, drop_last=False)
+    train_loader = DataLoader(
+        train_set,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=train_workers,
+        collate_fn=collate_pad,
+        drop_last=True,
+        persistent_workers=False,
+        pin_memory=False,
+        multiprocessing_context=("spawn" if train_workers > 0 else None),
+        prefetch_factor=(2 if train_workers > 0 else None),
+    )
+    val_loader   = DataLoader(
+        val_set,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=val_workers,
+        collate_fn=collate_pad,
+        drop_last=False,
+        persistent_workers=False,
+        pin_memory=False,
+        multiprocessing_context=("spawn" if val_workers > 0 else None),
+    )
 
     # ----------------- Modele -----------------
     with torch.no_grad():
@@ -338,208 +413,214 @@ def main():
     best_epoch = -1
 
     step_global = 0
-    for epoch in range(EPOCHS):
-        G.train(); D.train()
-        ep_lossD = ep_lossG = ep_g_gan = ep_g_spec = ep_r1 = 0.0
-        start_t = time.time()
+    try:
+        for epoch in range(EPOCHS):
+            G.train(); D.train()
+            ep_lossD = ep_lossG = ep_g_gan = ep_g_spec = ep_r1 = 0.0
+            start_t = time.time()
 
-        for ib, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")):
-            wave = batch["wave"].to(device)  # [B,1,T]
-            mel  = logmel_from_wave(wave)    # [B,M,T]
+            for ib, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")):
+                wave = batch["wave"].to(device, non_blocking=False)  # [B,1,T]
+                mel  = logmel_from_wave(wave)    # [B,M,T]
 
-            # ---------- Update D ----------
-            for _ in range(CRITIC_ITERS):
-                G.requires_grad_(False)
-                D.requires_grad_(True)
-                optD.zero_grad(set_to_none=True)
+                # ---------- Update D ----------
+                for _ in range(CRITIC_ITERS):
+                    G.requires_grad_(False)
+                    D.requires_grad_(True)
+                    optD.zero_grad(set_to_none=True)
+                    with autocast(device_type=device.type, enabled=AMP_ENABLED):
+                        with torch.no_grad():
+                            delta = torch.tanh(G(mel)) * delta_scale
+                            mel_fake = _safe(mel + delta)
+
+                        feats_real = feats_from_wave(wave)              # [B,C,T]
+                        feats_real.requires_grad_(True)
+                        feats_fake = feats_from_mel_no_wave(mel_fake)   # [B,C,T]
+
+                        feats_real_noisy = add_instance_noise(feats_real, inst_noise_std)
+                        feats_fake_noisy = add_instance_noise(feats_fake, inst_noise_std)
+
+                        d_real = D(feats_real_noisy)
+                        d_fake = D(feats_fake_noisy)
+                        lossD = wgan_d_loss(d_real, d_fake)
+
+                    with torch.cuda.amp.autocast(enabled=False):
+                        r1 = r1_regularizer(d_real.float(), feats_real_noisy.float()) * LAMBDA_R1
+                        totalD = lossD + r1
+
+                    scalerD.scale(totalD).backward()
+                    scalerD.step(optD)
+                    scalerD.update()
+
+                    ep_lossD += float(lossD.detach().cpu())
+                    ep_r1    += float(r1.detach().cpu())
+                    step_schedules()
+                    step_global += 1
+
+                # ---------- Update G ----------
+                G.requires_grad_(True)
+                D.requires_grad_(False)
+                optG.zero_grad(set_to_none=True)
                 with autocast(device_type=device.type, enabled=AMP_ENABLED):
-                    with torch.no_grad():
-                        delta = torch.tanh(G(mel)) * delta_scale
-                        mel_fake = _safe(mel + delta)
+                    delta = torch.tanh(G(mel)) * delta_scale
+                    mel_fake = _safe(mel + delta)
+                    feats_fake = feats_from_mel_no_wave(mel_fake)
+                    d_fake = D(add_instance_noise(feats_fake, inst_noise_std))
+                    g_gan = wgan_g_loss(d_fake)
+                    g_spec = spec_l1(mel_fake, mel)
+                    evasion = torch.tensor(0.0, device=device, dtype=mel.dtype)
+                    if keras_model is not None and EVASION_LAMBDA > 0.0 and (EVASION_EVERY <= 1 or (step_global % EVASION_EVERY) == 0):
+                        evasion = asv_evasion_penalty(keras_model, mel_fake)
+                    lossG = LAMBDA_GAN * g_gan + LAMBDA_SPEC * g_spec + EVASION_LAMBDA * evasion
 
-                    feats_real = feats_from_wave(wave)              # [B,C,T]
-                    feats_real.requires_grad_(True)
-                    feats_fake = feats_from_mel_no_wave(mel_fake)   # [B,C,T]
+                scalerG.scale(lossG).backward()
+                scalerG.step(optG)
+                scalerG.update()
+                ema.update(G)
 
-                    feats_real_noisy = add_instance_noise(feats_real, inst_noise_std)
-                    feats_fake_noisy = add_instance_noise(feats_fake, inst_noise_std)
+                ep_lossG += float(lossG.detach().cpu())
+                ep_g_gan += float(g_gan.detach().cpu())
+                ep_g_spec += float(g_spec.detach().cpu())
 
-                    d_real = D(feats_real_noisy)
-                    d_fake = D(feats_fake_noisy)
-                    lossD = wgan_d_loss(d_real, d_fake)
+                # ---------- Logging ----------
+                if is_main_process() and (ib + 1) % LOG_INTERVAL == 0:
+                    lrG = optG.param_groups[0]["lr"]
+                    lrD = optD.param_groups[0]["lr"]
+                    print(
+                        f"[ep {epoch}] step {ib+1:4d}  D={ep_lossD/(ib+1):.3f}  G={ep_lossG/(ib+1):.3f}  "
+                        f"g_gan={ep_g_gan/(ib+1):.3f}  g_spec={ep_g_spec/(ib+1):.3f}  r1={ep_r1/(ib+1):.3f}  "
+                        f"Δ={delta_scale:.4f}  σ={inst_noise_std:.3f}"
+                    )
+                    if csv_writer is not None:
+                        csv_writer.writerow([int(time.time()), epoch, ib+1,
+                                             f"{ep_lossD/(ib+1):.6f}", f"{ep_lossG/(ib+1):.6f}",
+                                             f"{ep_g_gan/(ib+1):.6f}", f"{ep_g_spec/(ib+1):.6f}",
+                                             f"{ep_r1/(ib+1):.6f}",
+                                             f"{lrG:.6f}", f"{lrD:.6f}",
+                                             f"{delta_scale:.6f}", f"{inst_noise_std:.6f}"])
+                        csv_file.flush()  # type: ignore
+                    if tb_writer is not None:
+                        tb_writer.add_scalar("train/D", ep_lossD/(ib+1), step_global)
+                        tb_writer.add_scalar("train/G", ep_lossG/(ib+1), step_global)
+                        tb_writer.add_scalar("train/g_gan", ep_g_gan/(ib+1), step_global)
+                        tb_writer.add_scalar("train/g_spec", ep_g_spec/(ib+1), step_global)
+                        tb_writer.add_scalar("train/r1", ep_r1/(ib+1), step_global)
+                        tb_writer.add_scalar("train/delta_scale", delta_scale, step_global)
+                        tb_writer.add_scalar("train/inst_noise", inst_noise_std, step_global)
 
-                with torch.cuda.amp.autocast(enabled=False):
-                    r1 = r1_regularizer(d_real.float(), feats_real_noisy.float()) * LAMBDA_R1
-                    totalD = lossD + r1
+            # ----------------- VALIDARE PE EPOCĂ -----------------
+            G.eval()
+            val_spec_sum, val_n = 0.0, 0
+            with torch.no_grad():
+                for vb in val_loader:
+                    vw = vb["wave"].to(device).float()
+                    vm = logmel_from_wave(vw)
+                    delta = torch.tanh(ema.shadow(vm)) * delta_scale
+                    vm_fake = _safe(vm + delta)
+                    val_spec_sum += float(nn.functional.l1_loss(vm_fake, vm).detach().cpu())
+                    val_n += 1
+            val_spec = val_spec_sum / max(1, val_n)
+            dur = time.time() - start_t
 
-                scalerD.scale(totalD).backward()
-                scalerD.step(optD)
-                scalerD.update()
-
-                ep_lossD += float(lossD.detach().cpu())
-                ep_r1    += float(r1.detach().cpu())
-                step_schedules()
-                step_global += 1
-
-            # ---------- Update G ----------
-            G.requires_grad_(True)
-            D.requires_grad_(False)
-            optG.zero_grad(set_to_none=True)
-            with autocast(device_type=device.type, enabled=AMP_ENABLED):
-                delta = torch.tanh(G(mel)) * delta_scale
-                mel_fake = _safe(mel + delta)
-                feats_fake = feats_from_mel_no_wave(mel_fake)
-                d_fake = D(add_instance_noise(feats_fake, inst_noise_std))
-                g_gan = wgan_g_loss(d_fake)
-                g_spec = spec_l1(mel_fake, mel)
-                evasion = torch.tensor(0.0, device=device, dtype=mel.dtype)
-                if keras_model is not None and EVASION_LAMBDA > 0.0 and (EVASION_EVERY <= 1 or (step_global % EVASION_EVERY) == 0):
-                    evasion = asv_evasion_penalty(keras_model, mel_fake)
-                lossG = LAMBDA_GAN * g_gan + LAMBDA_SPEC * g_spec + EVASION_LAMBDA * evasion
-
-            scalerG.scale(lossG).backward()
-            scalerG.step(optG)
-            scalerG.update()
-            ema.update(G)
-
-            ep_lossG += float(lossG.detach().cpu())
-            ep_g_gan += float(g_gan.detach().cpu())
-            ep_g_spec += float(g_spec.detach().cpu())
-
-            # ---------- Logging ----------
-            if is_main_process() and (ib + 1) % LOG_INTERVAL == 0:
-                lrG = optG.param_groups[0]["lr"]
-                lrD = optD.param_groups[0]["lr"]
-                print(f"[ep {epoch}] step {ib+1:4d}  D={ep_lossD/(ib+1):.3f}  G={ep_lossG/(ib+1):.3f}  g_gan={ep_g_gan/(ib+1):.3f}  g_spec={ep_g_spec/(ib+1):.3f}  r1={ep_r1/(ib+1):.3f}  Δ={delta_scale:.4f}  σ={inst_noise_std:.3f}")
-                if csv_writer is not None:
-                    csv_writer.writerow([int(time.time()), epoch, ib+1,
-                                         f"{ep_lossD/(ib+1):.6f}", f"{ep_lossG/(ib+1):.6f}",
-                                         f"{ep_g_gan/(ib+1):.6f}", f"{ep_g_spec/(ib+1):.6f}",
-                                         f"{ep_r1/(ib+1):.6f}",
-                                         f"{lrG:.6f}", f"{lrD:.6f}",
-                                         f"{delta_scale:.6f}", f"{inst_noise_std:.6f}"])
-                    csv_file.flush()  # type: ignore
-                if tb_writer is not None:
-                    tb_writer.add_scalar("train/D", ep_lossD/(ib+1), step_global)
-                    tb_writer.add_scalar("train/G", ep_lossG/(ib+1), step_global)
-                    tb_writer.add_scalar("train/g_gan", ep_g_gan/(ib+1), step_global)
-                    tb_writer.add_scalar("train/g_spec", ep_g_spec/(ib+1), step_global)
-                    tb_writer.add_scalar("train/r1", ep_r1/(ib+1), step_global)
-                    tb_writer.add_scalar("train/delta_scale", delta_scale, step_global)
-                    tb_writer.add_scalar("train/inst_noise", inst_noise_std, step_global)
-
-            # FĂRĂ samples/checkpoints în timpul epocii — păstrăm doar best pe epocă
-
-        # ----------------- VALIDARE PE EPOCĂ -----------------
-        G.eval()
-        val_spec_sum, val_n = 0.0, 0
-        with torch.no_grad():
-            for vb in val_loader:
-                vw = vb["wave"].to(device).float()
-                vm = logmel_from_wave(vw)
-                delta = torch.tanh(ema.shadow(vm)) * delta_scale
-                vm_fake = _safe(vm + delta)
-                val_spec_sum += float(nn.functional.l1_loss(vm_fake, vm).detach().cpu())
-                val_n += 1
-        val_spec = val_spec_sum / max(1, val_n)
-        dur = time.time() - start_t
-
-        if is_main_process():
-            print(f"[VAL] epoch {epoch+1}/{EPOCHS}  val_spec={val_spec:.4f}  time={dur/60.0:.1f}min")
-            if tb_writer is not None:
-                tb_writer.add_scalar("val/spec_l1", val_spec, epoch+1)
-                tb_writer.add_scalar("epoch/delta_scale", delta_scale, epoch+1)
-                tb_writer.add_scalar("epoch/inst_noise", inst_noise_std, epoch+1)
-                tb_writer.add_scalar("epoch/lrG", optG.param_groups[0]['lr'], epoch+1)
-                tb_writer.add_scalar("epoch/lrD", optD.param_groups[0]['lr'], epoch+1)
-                tb_writer.add_scalar("epoch/g_gan", ep_g_gan / max(1, ib+1), epoch+1)
-                tb_writer.add_scalar("epoch/g_spec", ep_g_spec / max(1, ib+1), epoch+1)
-                tb_writer.add_scalar("epoch/r1", ep_r1 / max(1, ib+1), epoch+1)
-
-        # ---------- BEST-ONLY: salvează doar dacă s-a îmbunătățit ----------
-        improved = val_spec < best_val
-        if improved:
-            best_val = val_spec
-            best_epoch = epoch + 1
-
-            # Checkpoint best
-            save_ckpt_best("best")
-
-            # Samples best (2 exemple din batch de validare curent folosit mai sus)
             if is_main_process():
-                with torch.no_grad():
-                    # Folosim primele două wave-uri din primul batch de validare reîncărcat rapid
-                    try:
-                        vb0 = next(iter(val_loader))
-                        wave_dbg = vb0["wave"][:2].to(device)
-                    except Exception:
-                        wave_dbg = torch.randn(2, 1, int(1.0 * SR), device=device)
-                    mel_dbg = logmel_from_wave(wave_dbg)
-                    delta_dbg = torch.tanh(ema.shadow(mel_dbg)) * delta_scale
-                    mel_fake_dbg = _safe(mel_dbg + delta_dbg)
-                    wav_fake = mel2wav(mel_fake_dbg)
-                    for i in range(min(wav_fake.size(0), 2)):
-                        wf = wav_fake[i].detach().cpu().unsqueeze(0).clamp_(-1.0, 1.0)
-                        torchaudio.save(str(samples_dir / f"best_ep{best_epoch:03d}_{i}.wav"), wf, SR)
-                print(f"[BEST] ep={best_epoch}  val_spec={best_val:.4f}  -> checkpoint + samples salvate în {save_dir}")
+                print(f"[VAL] epoch {epoch+1}/{EPOCHS}  val_spec={val_spec:.4f}  time={dur/60.0:.1f}min")
+                if tb_writer is not None:
+                    tb_writer.add_scalar("val/spec_l1", val_spec, epoch+1)
+                    tb_writer.add_scalar("epoch/delta_scale", delta_scale, epoch+1)
+                    tb_writer.add_scalar("epoch/inst_noise", inst_noise_std, epoch+1)
+                    tb_writer.add_scalar("epoch/lrG", optG.param_groups[0]['lr'], epoch+1)
+                    tb_writer.add_scalar("epoch/lrD", optD.param_groups[0]['lr'], epoch+1)
+                    tb_writer.add_scalar("epoch/g_gan", ep_g_gan / max(1, ib+1), epoch+1)
+                    tb_writer.add_scalar("epoch/g_spec", ep_g_spec / max(1, ib+1), epoch+1)
+                    tb_writer.add_scalar("epoch/r1", ep_r1 / max(1, ib+1), epoch+1)
 
-        # ---------- Early stop (nu mai salvează nimic în afară de best) ----------
-        if EARLY_STOP_ENABLED and early is not None:
-            stop = early.step(val_spec)
-            if stop:
+            # ---------- BEST-ONLY ----------
+            if val_spec < best_val:
+                best_val = val_spec
+                best_epoch = epoch + 1
+
+                save_ckpt_best("best")
+
+                if is_main_process():
+                    with torch.no_grad():
+                        try:
+                            vb0 = next(iter(val_loader))
+                            wave_dbg = vb0["wave"][:2].to(device)
+                        except Exception:
+                            wave_dbg = torch.randn(2, 1, int(1.0 * SR), device=device)
+                        mel_dbg = logmel_from_wave(wave_dbg)
+                        delta_dbg = torch.tanh(ema.shadow(mel_dbg)) * delta_scale
+                        mel_fake_dbg = _safe(mel_dbg + delta_dbg)
+                        wav_fake = mel2wav(mel_fake_dbg)
+                        for i in range(min(wav_fake.size(0), 2)):
+                            wf = wav_fake[i].detach().cpu().unsqueeze(0).clamp_(-1.0, 1.0)
+                            outp = samples_dir / f"best_ep{best_epoch:03d}_{i}.wav"
+                            try:
+                                torchaudio.save(str(outp), wf, SR)
+                            except Exception as e:
+                                print(f"[WARN] nu pot salva {outp}: {e}")
+                    print(f"[BEST] ep={best_epoch}  val_spec={best_val:.4f}  -> checkpoint + samples salvate în {save_dir}")
+
+            # ---------- Early stop ----------
+            if EARLY_STOP_ENABLED and early is not None and early.step(val_spec):
                 if is_main_process():
                     print(f"[EarlyStop] Stop la epoca {epoch+1}. Best val_spec={early.best:.4f} @ epoca {best_epoch}")
                 break
 
-    # --------- Post-run: plot & închideri (nu salvează alte ckpt-uri) ----------
-    if is_main_process():
-        print(f"Training încheiat. Best @ epoca {best_epoch} cu val_spec={best_val:.4f}. Checkpoints & samples în: {save_dir}")
+    except KeyboardInterrupt:
+        if is_main_process():
+            print("\n[CTRL-C] Oprit de utilizator.")
+    finally:
+        if is_main_process():
+            print(f"Training încheiat. Best @ epoca {best_epoch} cu val_spec={best_val:.4f}. Checkpoints & samples în: {save_dir}")
 
-        # Auto-plot din CSV în PNG
-        try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-            import pandas as pd
+            # Plot-uri din CSV
+            try:
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+                import pandas as pd
 
-            df = pd.read_csv(csv_path)
-            x = np.arange(len(df))
+                df = pd.read_csv(save_dir / "train_log.csv")
+                x = np.arange(len(df))
 
-            def _plot_one(ycols, title, fname):
-                plt.figure()
-                for col in ycols:
-                    if col in df.columns:
-                        plt.plot(x, df[col], label=col)
-                plt.title(title)
-                plt.xlabel("log step")
-                plt.ylabel(title)
-                plt.legend()
-                plt.tight_layout()
-                out = (save_dir / "plots" / fname)
-                plt.savefig(out)
-                plt.close()
-                print(f"[PLOT] {out}")
+                (save_dir / "plots").mkdir(parents=True, exist_ok=True)
 
-            _plot_one(["D","G"], "Loss D/G", "loss_DG.png")
-            _plot_one(["g_gan","g_spec","r1"], "GAN/Spec/R1", "components.png")
-            _plot_one(["delta","inst_noise"], "Schedules", "schedules.png")
-            _plot_one(["lrG","lrD"], "Learning Rates", "lrs.png")
+                def _plot_one(ycols, title, fname):
+                    plt.figure()
+                    for col in ycols:
+                        if col in df.columns:
+                            plt.plot(x, df[col], label=col)
+                    plt.title(title)
+                    plt.xlabel("log step")
+                    plt.ylabel(title)
+                    plt.legend()
+                    plt.tight_layout()
+                    out = (save_dir / "plots" / fname)
+                    plt.savefig(out)
+                    plt.close()
+                    print(f"[PLOT] {out}")
 
-        except Exception as e:
-            print(f"[WARN] Plotting a eșuat: {e}")
+                _plot_one(["D","G"], "Loss D/G", "loss_DG.png")
+                _plot_one(["g_gan","g_spec","r1"], "GAN/Spec/R1", "components.png")
+                _plot_one(["delta","inst_noise"], "Schedules", "schedules.png")
+                _plot_one(["lrG","lrD"], "Learning Rates", "lrs.png")
 
-        try:
-            if csv_file is not None:
-                csv_file.flush()
-                csv_file.close()
-        except Exception:
-            pass
-        try:
-            if tb_writer is not None:
-                tb_writer.flush()
-                tb_writer.close()
-        except Exception:
-            pass
+            except Exception as e:
+                print(f"[WARN] Plotting a eșuat: {e}")
+
+            try:
+                if 'csv_file' in locals() and csv_file is not None:
+                    csv_file.flush()
+                    csv_file.close()
+            except Exception:
+                pass
+            try:
+                if 'tb_writer' in locals() and tb_writer is not None:
+                    tb_writer.flush()
+                    tb_writer.close()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()
