@@ -1,9 +1,8 @@
-# constants.py — tuned for stronger WGAN training (defensive / research)
+# constants.py — config stabil pentru DDP + ASV
 from pathlib import Path
 
 # ----------------- Audio / Features -----------------
 SR = 16000
-# lungimea maximă a unui exemplu în antrenare (sec)
 MAX_AUDIO_SECONDS = 4
 SEGMENT_SAMPLES   = MAX_AUDIO_SECONDS * SR
 
@@ -13,30 +12,34 @@ HOP_LENGTH = 160      # 10 ms @ 16k
 WIN_LENGTH = 400      # 25 ms @ 16k
 FMIN = 20
 FMAX = 7600
-POWER = 1.0           # magnitude spectrogram power for mel
+POWER = 1.0
 
 FEATS_MEAN = 0.0
 FEATS_STD  = 1.0
 
-# Paths
+# ----------------- Paths -----------------
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "database" / "data"
+
 SAVE_DIR = ROOT / "runs"
-SAVE_DIR.mkdir(parents=True, exist_ok=True)
+SAMPLES_DIR = SAVE_DIR / "samples"
+CKPT_DIR    = SAVE_DIR / "checkpoints"
+LOG_CSV     = SAVE_DIR / "train_log.csv"
+for p in (SAVE_DIR, SAMPLES_DIR, CKPT_DIR):
+    p.mkdir(parents=True, exist_ok=True)
 
 # ----------------- Training -----------------
-AMP_ENABLED = True            # mixed precision for speed/stability
+AMP_ENABLED = True
 BATCH_SIZE = 4
-EPOCHS = 1000                 # high cap; early stopping will typically stop earlier
+EPOCHS = 1000
 
-# TTUR (Two Time-scale) — D slightly faster than G
+# TTUR
 LR_G = 1e-4
 LR_D = 2e-4
 BETA1 = 0.0
 BETA2 = 0.99
 WEIGHT_DECAY = 0.0
 
-# More critic updates initially -> stronger critic signal
 CRITIC_ITERS = 3
 GRAD_CLIP = 5.0
 
@@ -44,32 +47,27 @@ GRAD_CLIP = 5.0
 LAMBDA_GAN  = 1.0
 LAMBDA_SPEC = 3.0
 LAMBDA_FM   = 1.0
-# stronger R1 regularization (applied lazily)
 LAMBDA_R1   = 10.0
 R1_EVERY    = 16
 
-# Schedules for instance noise & dithering (applied to inputs of D / spectrograms)
+# Schedules (stabilize)
 DELTA_INIT  = 0.02
 DELTA_MIN   = 0.002
-DELTA_DECAY = 0.9999  # slower decay
+DELTA_DECAY = 0.9999
 
 INST_NOISE_INIT  = 0.02
 INST_NOISE_MIN   = 0.0
-INST_NOISE_DECAY = 0.9999  # slower decay to stabilize longer
+INST_NOISE_DECAY = 0.9999
 
-# Evasion warm-up
+# Evasion schedule
 EVASION_WARMUP_STEPS = 5000
 EVASION_RAMP_STEPS   = 15000
 LAMBDA_EVASION_MAX   = 1.0
 
 # Logging / saving
 LOG_INTERVAL = 100
-VAL_INTERVAL = 999999999  # not using validation by default
 SAVE_AUDIO_EVERY_EPOCH = True
-SAMPLES_DIR = SAVE_DIR / "samples"
-CKPT_DIR    = SAVE_DIR / "checkpoints"
-LOG_CSV     = SAVE_DIR / "train_log.csv"
-BEST_BY     = "p_bona_mean"  # primary metric
+BEST_BY = "p_bona_mean"
 
 # Misc
 SEED = 1337
@@ -80,31 +78,26 @@ PIN_MEMORY = True
 USE_EMA = True
 EMA_DECAY = 0.999
 
-# Surrogate ASV (optional but recommended)
+# Surrogate ASV
 USE_SURROGATE = True
 SURROGATE_LR = 2e-4
 SURROGATE_BETA1 = 0.9
 SURROGATE_BETA2 = 0.999
-SURROGATE_W = 1.0  # weight inside evasion term
+SURROGATE_W = 1.0               # weight în loss-ul de evasion
+SURROGATE_UPDATE_EVERY = 5      # pași între update-urile surrogate (pe rank-0)
 
-# Early stop target (ASV bona_fide probability)
+# Early stop (evaluat pe rank-0; aplicat la final de epocă)
 TARGET_P_BONA = 0.80
-TARGET_WINDOW = 20        # rolling window (number of logged entries) for smoothing
-MIN_STEPS_TO_CHECK = 2000 # don't consider early stopping earlier than this many steps
-
-# Safety caps
+TARGET_WINDOW = 20
+MIN_STEPS_TO_CHECK = 2000
 MAX_TRAIN_STEPS = 5_000_000
 
-# ----------------- ASVspoof strict adapter (infer_ahkmno source of truth) -----------------
+# Keras logging (opțional, mai lent; dacă False, folosește surrogate pt. metrică)
+LOG_WITH_KERAS = False
+
+# ----------------- ASVspoof strict adapter -----------------
 ASV_COMBO = "AHKMNO"
-ASV_MODEL_PATH = ROOT / "ASVmodel" / "best_model.keras"
+ASV_MODEL_PATH = ROOT / "ASVmodel" / "best_model.keras"  # sau .h5; auto-detect în loader
 ASV_SCALER_PATH = ROOT / "ASVmodel" / "scaler.pkl"
 ASV_TMP_DIR = SAVE_DIR / "_tmp_asv"
 ASV_TMP_DIR.mkdir(parents=True, exist_ok=True)
-
-LOG_WITH_KERAS = False        # True = folosește Keras la logging (lent!)
-ALLREDUCE_EVERY_STEPS = 50    # nu mai facem allreduce la fiecare iterație
-
-# ---- Surrogate / Keras target ----
-SURROGATE_UPDATE_EVERY = 50   # mai rar; reduce încărcarea CPU/FS
-SURROGATE_MAX_SAMPLES = 2 

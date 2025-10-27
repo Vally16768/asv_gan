@@ -1,10 +1,7 @@
-# train.py — WGAN-R1 + TTUR + EMA + surrogate, cu:
-#  - MRSTFT persistent (nu mai alocăm la fiecare iterație)
-#  - logging rapid (folosește surrogate, NU Keras)
-#  - update surrogate rar și pe micro-batch mic (reduce CPU I/O)
-#  - allreduce 'should_stop' mai rar, ca să nu blocheze rank-urile
+# train.py — DDP stabil: seed identic pentru model, mixup sincronizat,
+# static_graph=True, Keras/ASV doar pe rank-0, broadcast surrogate o dată/epocă.
 from __future__ import annotations
-import os, random
+import os, random, datetime
 from pathlib import Path
 from collections import deque
 import numpy as np
@@ -28,9 +25,9 @@ from constants import (
     LOG_INTERVAL, SAVE_AUDIO_EVERY_EPOCH,
     SEED, SR, USE_EMA, EMA_DECAY,
     USE_SURROGATE, SURROGATE_LR, SURROGATE_BETA1, SURROGATE_BETA2, SURROGATE_W,
-    SURROGATE_UPDATE_EVERY, SURROGATE_MAX_SAMPLES,
+    SURROGATE_UPDATE_EVERY,
     TARGET_P_BONA, TARGET_WINDOW, MIN_STEPS_TO_CHECK, MAX_TRAIN_STEPS,
-    LOG_WITH_KERAS, ALLREDUCE_EVERY_STEPS
+    LOG_WITH_KERAS
 )
 from dataset import ASVBonafideDataset, pad_collate
 from models import Generator, MultiScaleCritic, SurrogateDetector
@@ -44,12 +41,25 @@ from detector_wrapper import DetectorWrapper
 
 torch.backends.cudnn.benchmark = True
 
-def set_seed(seed: int):
+
+# ---------- seeding ----------
+def seed_all(s: int):
     import numpy as _np
-    random.seed(seed); torch.manual_seed(seed); _np.random.seed(seed)
+    random.seed(s); torch.manual_seed(s); _np.random.seed(s)
+
+def seed_data_rng(s: int):
+    # RNG separat pentru augmentări; poate fi diferit pe rank fără să afecteze modelul/DDP
+    import numpy as _np
+    rnd = random.Random(s)
+    g = torch.Generator()
+    g.manual_seed(s)
+    _np.random.seed(s)
+    return rnd, g
+
 
 def is_main(rank: int) -> bool:
     return rank == 0
+
 
 class EMA:
     def __init__(self, model: nn.Module, decay=0.999):
@@ -60,19 +70,39 @@ class EMA:
         for k, v in model.state_dict().items():
             self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
 
+
 def ddp_state_dict(m: nn.Module):
     return m.module.state_dict() if hasattr(m, "module") else m.state_dict()
+
 
 def build_roots_patterns() -> list[str]:
     base = (ROOT / "database" / "data").resolve()
     exts = ["flac", "wav", "mp3", "ogg", "m4a"]
     return [str(base / "**" / f"*.{e}") for e in exts]
 
+
+def broadcast_bool(flag: bool, device, world_size: int) -> bool:
+    t = torch.tensor(1 if flag else 0, device=device, dtype=torch.int32)
+    if world_size > 1:
+        dist.broadcast(t, src=0)
+    return bool(int(t.item()))
+
+
+def broadcast_tensor(t: torch.Tensor, world_size: int) -> torch.Tensor:
+    if world_size > 1:
+        dist.broadcast(t, src=0)
+    return t
+
+
 def main():
-    # — evită timeouts premature dacă logging-ul durează —
+    # Env sigure (corectați variabila deprecated)
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
-    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
-    os.environ.setdefault("NCCL_TIMEOUT", "1800")  # sec
+    # opțional pt. un singur nod instabil de rețea:
+    os.environ.setdefault("NCCL_IB_DISABLE", "1")
+    os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+    os.environ.setdefault("NCCL_PROTO", "SIMPLE")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
 
     ngpus = torch.cuda.device_count()
     if ngpus > 1:
@@ -82,50 +112,68 @@ def main():
     else:
         main_worker(0, 1)
 
+
 def main_worker(rank: int, world_size: int):
-    set_seed(SEED + rank)
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     if world_size > 1:
         torch.cuda.set_device(rank)
-        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+        dist.init_process_group(
+            backend="nccl",
+            rank=rank,
+            world_size=world_size,
+            timeout=datetime.timedelta(seconds=3600)
+        )
+
+    # --- Seed identic pentru MODEL (IMPORTANT) ---
+    seed_all(SEED)               # toți rank-ii același seed pentru inițializarea modelului
+    data_rnd, torch_data_gen = seed_data_rng(SEED + rank)  # RNG separat pentru augmentări
 
     # I/O
-    os.makedirs(SAVE_DIR, exist_ok=True)
-    os.makedirs(CKPT_DIR, exist_ok=True)
-    os.makedirs(SAMPLES_DIR, exist_ok=True)
+    for p in (SAVE_DIR, CKPT_DIR, SAMPLES_DIR):
+        os.makedirs(p, exist_ok=True)
 
-    # ----------------- Data -----------------
+    # ----- Data -----
     roots = build_roots_patterns()
-    train_ds = ASVBonafideDataset(roots=roots)  # dataset bonafide :contentReference[oaicite:0]{index=0}
+    train_ds = ASVBonafideDataset(roots=roots)
     sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank,
                                  shuffle=True, drop_last=True) if world_size > 1 else None
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=(sampler is None),
         sampler=sampler, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
-        collate_fn=pad_collate, drop_last=True
+        collate_fn=pad_collate, drop_last=True,
+        generator=torch_data_gen
     )
 
-    # ----------------- Models -----------------
-    G = Generator().to(device)                     # :contentReference[oaicite:1]{index=1}
-    D = MultiScaleCritic().to(device)              # :contentReference[oaicite:2]{index=2}
+    # ----- Models (create cu seed identic) -----
+    G = Generator().to(device)
+    D = MultiScaleCritic().to(device)
     mel_feat = LogMel().to(device)
-    mrstft = MRSTFTLoss().to(device)               # persistent instance (FIX)
+    mrstft = MRSTFTLoss().to(device)
     ema = EMA(G, decay=EMA_DECAY) if (USE_EMA and is_main(rank)) else None
 
-    surrogate = SurrogateDetector(mel_bins=mel_feat.mel.n_mels, hidden=2048).to(device) if USE_SURROGATE else None  # :contentReference[oaicite:3]{index=3}
-    detwrap = DetectorWrapper()  # Keras ASV, CPU strict :contentReference[oaicite:4]{index=4}
+    surrogate = SurrogateDetector(mel_bins=mel_feat.mel.n_mels, hidden=2048).to(device) if USE_SURROGATE else None
 
-    # DDP wrap
+    # Keras ASV doar pe rank-0
+    detwrap = DetectorWrapper() if is_main(rank) else None
+
+    # DDP wrap — static_graph=True pentru a opri rebuild-ul bucket-urilor în runtime
     if world_size > 1:
-        G = torch.nn.parallel.DistributedDataParallel(G, device_ids=[rank], output_device=rank, broadcast_buffers=False)
-        D = torch.nn.parallel.DistributedDataParallel(D, device_ids=[rank], output_device=rank, broadcast_buffers=False)
+        G = torch.nn.parallel.DistributedDataParallel(
+            G, device_ids=[rank], output_device=rank, broadcast_buffers=False, static_graph=True
+        )
+        D = torch.nn.parallel.DistributedDataParallel(
+            D, device_ids=[rank], output_device=rank, broadcast_buffers=False, static_graph=True
+        )
         if surrogate is not None:
-            surrogate = torch.nn.parallel.DistributedDataParallel(surrogate, device_ids=[rank], output_device=rank, broadcast_buffers=False)
+            surrogate = torch.nn.parallel.DistributedDataParallel(
+                surrogate, device_ids=[rank], output_device=rank, broadcast_buffers=False, static_graph=True
+            )
 
     # Optims + scalers
     optG = optim.AdamW(G.parameters(), lr=LR_G, betas=(BETA1, BETA2), weight_decay=WEIGHT_DECAY)
     optD = optim.AdamW(D.parameters(), lr=LR_D, betas=(BETA1, BETA2), weight_decay=WEIGHT_DECAY)
-    optS = optim.Adam(surrogate.parameters(), lr=SURROGATE_LR, betas=(SURROGATE_BETA1, SURROGATE_BETA2)) if surrogate is not None else None
+    optS = optim.Adam(surrogate.parameters(), lr=SURROGATE_LR,
+                      betas=(SURROGATE_BETA1, SURROGATE_BETA2)) if surrogate is not None else None
     scalerD = GradScaler(enabled=AMP_ENABLED)
     scalerG = GradScaler(enabled=AMP_ENABLED)
 
@@ -134,33 +182,44 @@ def main_worker(rank: int, world_size: int):
     delta = DELTA_INIT
     best_metric = -1.0
     lambda_evasion = 0.0
+    want_stop = False
 
     if is_main(rank):
         print(f"Params G: {count_params(G)/1e6:.2f}M, D: {count_params(D)/1e6:.2f}M, Surrogate: {(count_params(surrogate)/1e6 if surrogate else 0):.2f}M")
 
     p_window = deque(maxlen=TARGET_WINDOW)
-    should_stop = torch.tensor(0, device=device)
 
     for epoch in range(1, EPOCHS + 1):
         if sampler is not None:
             sampler.set_epoch(epoch)
 
-        pbar = tqdm(total=len(train_loader), disable=not is_main(rank), desc=f"Epoch {epoch}/{EPOCHS}", ncols=100)
+        pbar = tqdm(total=len(train_loader), disable=not is_main(rank),
+                    desc=f"Epoch {epoch}/{EPOCHS}", ncols=100)
 
         for it, (x, paths) in enumerate(train_loader):
+            if want_stop:
+                break
+
             G.train(); D.train()
             x = x.to(device, non_blocking=True)
 
-            # mixup mic
-            if random.random() < 0.3:
-                perm = torch.randperm(x.size(0), device=device)
+            # ----- MIXUP SINCRONIZAT -----
+            want_mix = data_rnd.random() < 0.3
+            want_mix = broadcast_bool(want_mix, device, world_size)
+            if want_mix:
+                # permutare hotărâtă pe rank-0 și broadcastată
+                if is_main(rank):
+                    perm = torch.randperm(x.size(0), device=device)
+                else:
+                    perm = torch.empty(x.size(0), device=device, dtype=torch.long)
+                perm = broadcast_tensor(perm, world_size)
                 x = 0.7 * x + 0.3 * x[perm]
 
-            # -------- G forward
+            # ----- forward G
             with autocast(device_type='cuda', enabled=AMP_ENABLED):
                 y = G(x)
 
-            # -------- D train (WGAN-R1)
+            # ----- D train (WGAN + lazy R1)
             for _ in range(CRITIC_ITERS):
                 optD.zero_grad(set_to_none=True)
                 with autocast(device_type='cuda', enabled=AMP_ENABLED):
@@ -181,26 +240,24 @@ def main_worker(rank: int, world_size: int):
 
                 lossD_total = lossD + LAMBDA_R1 * r1
                 scalerD.scale(lossD_total).backward()
-                scalerD.step(optD)
-                scalerD.update()
+                scalerD.step(optD); scalerD.update()
 
-            # -------- G train
+            # ----- G train
             optG.zero_grad(set_to_none=True)
             with autocast(device_type='cuda', enabled=AMP_ENABLED):
                 sr_fake, ff_fake = D(y.unsqueeze(1))
                 lossG_gan = g_loss_wgan(sr_fake) * LAMBDA_GAN
 
-                # MRSTFT persistent (FIX OOM) + mel L1
-                loss_mrstft = mrstft(y, x)                            # :contentReference[oaicite:5]{index=5}
+                loss_mrstft = mrstft(y, x)
                 mel_x = mel_feat(x); mel_y = mel_feat(y)
                 loss_mel = torch.nn.functional.l1_loss(safe(mel_y), safe(mel_x))
 
                 with torch.no_grad():
                     sr_real, ff_real = D(x.unsqueeze(1))
-                loss_fm = feature_matching_loss(ff_real, ff_fake) * LAMBDA_FM  # :contentReference[oaicite:6]{index=6}
+                loss_fm = feature_matching_loss(ff_real, ff_fake) * LAMBDA_FM
                 loss_spec = (loss_mrstft + loss_mel) * LAMBDA_SPEC
 
-                # schedule evasion
+                # evasion schedule
                 if global_step < EVASION_WARMUP_STEPS:
                     lambda_evasion = 0.0
                 else:
@@ -218,47 +275,44 @@ def main_worker(rank: int, world_size: int):
             if GRAD_CLIP and GRAD_CLIP > 0:
                 scalerG.unscale_(optG)
                 torch.nn.utils.clip_grad_norm_(G.parameters(), GRAD_CLIP)
-            scalerG.step(optG)
-            scalerG.update()
+            scalerG.step(optG); scalerG.update()
 
             if ema is not None:
                 ema.update(G.module if hasattr(G, "module") else G)
 
-            # -------- Surrogate update (RAR, micro-batch mic, ca să nu blocheze) --------
-            if (surrogate is not None) and (global_step % SURROGATE_UPDATE_EVERY == 0):
+            # ----- Surrogate update: DOAR rank-0 (rar)
+            if is_main(rank) and (surrogate is not None) and (global_step % SURROGATE_UPDATE_EVERY == 0):
                 with torch.no_grad():
                     mel_y_det = mel_feat(y.detach())
                 try:
-                    # limităm la câteva eșantioane pentru a reduce CPU:
-                    y_small = y.detach().cpu()[:max(1, min(SURROGATE_MAX_SAMPLES, y.size(0)))]
-                    keras_np = detwrap.keras_prob(y_small)            # CPU strict ASV :contentReference[oaicite:7]{index=7}
-                    # replicăm ținta pe restul batchului (aproximare ieftină)
-                    if y_small.size(0) < y.size(0):
-                        keras_np = np.pad(keras_np, (0, y.size(0)-y_small.size(0)), mode='edge')
-                    keras_t = torch.from_numpy(keras_np).float().to(device)
-                    optS.zero_grad(set_to_none=True)
-                    logits = surrogate(mel_y_det)
-                    loss_sur = torch.nn.functional.binary_cross_entropy_with_logits(logits, keras_t)
-                    loss_sur.backward()
-                    optS.step()
+                    if detwrap is not None:
+                        keras_np = detwrap.keras_prob(y.detach().cpu())
+                        keras_t = torch.from_numpy(keras_np).float().to(device)
+                        optS.zero_grad(set_to_none=True)
+                        logits = surrogate(mel_y_det)
+                        loss_sur = torch.nn.functional.binary_cross_entropy_with_logits(logits, keras_t)
+                        loss_sur.backward()
+                        optS.step()
                 except Exception as e:
                     if is_main(rank):
                         print(f"[ASVmodel] Surrogate update skipped: {e}")
 
-            # -------- Schedules --------
+            # ----- Schedules
             inst_noise = max(INST_NOISE_MIN, inst_noise * INST_NOISE_DECAY)
             delta = max(DELTA_MIN, delta * DELTA_DECAY)
 
-            # -------- Logging (NU bloca rank-urile cu Keras) --------
+            # ----- Logging (rank-0)
             if is_main(rank) and (global_step % LOG_INTERVAL == 0):
-                if LOG_WITH_KERAS:
-                    # atenție: poate fi lent — dacă îl activezi, crește NCCL_TIMEOUT
+                if LOG_WITH_KERAS and detwrap is not None:
                     p_bona = detwrap.keras_prob(y.detach().cpu())
                     p_bona_mean = float(np.mean(p_bona))
                 else:
-                    # proxy rapid: sigmoid pe surrogate logits (fără CPU I/O)
                     with torch.no_grad():
-                        p_bona_mean = float(torch.sigmoid(surrogate(mel_feat(y.detach()))).mean().item()) if surrogate is not None else 0.0
+                        if surrogate is not None:
+                            logits = surrogate(mel_feat(y.detach()))
+                            p_bona_mean = float(torch.sigmoid(logits).mean().item())
+                        else:
+                            p_bona_mean = 0.0
 
                 row = {
                     "step": global_step, "epoch": epoch,
@@ -283,55 +337,43 @@ def main_worker(rank: int, world_size: int):
                     torch.save(state, Path(CKPT_DIR) / "best.pth")
                     tqdm.write(f"[{global_step}] New best p_bona_mean = {best_metric:.4f} -> saved best.pth")
 
-                pbar.set_postfix({
-                    "p_bona": f"{p_bona_mean:.3f}",
-                    "lossG": f"{lossG_total.item():.3f}",
-                    "lossD": f"{lossD_total.item():.3f}"
-                })
-
-            # -------- Early-stop sync mai rar (nu la fiecare iterație) --------
-            do_sync = (world_size > 1) and (global_step % ALLREDUCE_EVERY_STEPS == 0)
-            if do_sync:
-                if is_main(rank) and (global_step >= MIN_STEPS_TO_CHECK) and (len(p_window) == TARGET_WINDOW):
-                    import numpy as _np
-                    rolling_mean = float(_np.mean(p_window))
-                    if rolling_mean >= TARGET_P_BONA:
-                        tqdm.write(f"EARLY STOP: rolling_mean {rolling_mean:.4f} ≥ target {TARGET_P_BONA:.2f} @ step {global_step}")
-                        should_stop.fill_(1)
-                # toți participă, dar rar → mult mai puține blocaje
-                dist.all_reduce(should_stop, op=dist.ReduceOp.SUM)
-
-            if int(should_stop.item()) > 0:
-                if is_main(rank):
-                    final_state = {"G": ddp_state_dict(G), "D": ddp_state_dict(D), "step": global_step, "epoch": epoch}
-                    if ema is not None:
-                        final_state["G_EMA"] = ema.shadow
-                    torch.save(final_state, Path(CKPT_DIR) / f"final_step{global_step:07d}.pth")
-                if is_main(rank): pbar.close()
-                return
-
-            if global_step >= MAX_TRAIN_STEPS:
-                if is_main(rank): pbar.close()
-                return
+                # Early-stop (doar rank-0): oprim la finalul epocii
+                if (global_step >= MIN_STEPS_TO_CHECK) and (len(p_window) == TARGET_WINDOW):
+                    if float(np.mean(p_window)) >= TARGET_P_BONA:
+                        tqdm.write(f"EARLY STOP candidate @ step {global_step}")
+                        want_stop = True
 
             global_step += 1
             if is_main(rank): pbar.update(1)
+            if global_step >= MAX_TRAIN_STEPS:
+                want_stop = True
 
-        # end epoch
+        # ---- final epocă: checkpoint + samples + (opțional) broadcast surrogate
         if is_main(rank):
             if SAVE_AUDIO_EVERY_EPOCH:
                 with torch.no_grad():
                     save_wave(Path(SAMPLES_DIR) / f"ep{epoch:03d}_fake.wav", y[0].detach().cpu(), SR)
                     save_wave(Path(SAMPLES_DIR) / f"ep{epoch:03d}_real.wav", x[0].detach().cpu(), SR)
-            ckpt_path = Path(CKPT_DIR) / f"epoch{epoch:03d}.pth"
             state = {"G": ddp_state_dict(G), "D": ddp_state_dict(D), "step": global_step, "epoch": epoch}
             if ema is not None:
                 state["G_EMA"] = ema.shadow
-            torch.save(state, ckpt_path)
-            pbar.close()
+            torch.save(state, Path(CKPT_DIR) / f"epoch{epoch:03d}.pth")
+
+        if world_size > 1:
+            dist.barrier()
+            if surrogate is not None:
+                mod = surrogate.module if hasattr(surrogate, "module") else surrogate
+                for p in mod.state_dict().values():
+                    dist.broadcast(p.data, src=0)
+            dist.barrier()
+
+        if is_main(rank): pbar.close()
+        if want_stop:
+            break
 
     if world_size > 1:
         dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     main()
