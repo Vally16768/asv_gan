@@ -42,6 +42,24 @@ from detector_wrapper import DetectorWrapper
 torch.backends.cudnn.benchmark = True
 
 
+# ---------- helpers numeric-stability ----------
+def isfinite_tensor(x: torch.Tensor) -> bool:
+    return torch.isfinite(x).all().item()
+
+def safe_tensor(x: torch.Tensor) -> torch.Tensor:
+    # taie valori extreme, elimină NaN/Inf
+    return torch.nan_to_num(x.clamp(min=-10.0, max=10.0), nan=0.0, posinf=1e4, neginf=-1e4)
+
+def norm_wave_per_sample(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    x: [B, T] — normalizează per-sample la zero-mean / unit-std și limitează amplitudinea.
+    """
+    mean = x.mean(dim=1, keepdim=True)
+    std = x.std(dim=1, keepdim=True)
+    std = torch.where(std < eps, torch.full_like(std, eps), std)
+    xn = (x - mean) / std
+    return xn.clamp(-3.0, 3.0)  # ținem valori rezonabile înainte de D/G
+
 # ---------- seeding ----------
 def seed_all(s: int):
     import numpy as _np
@@ -201,7 +219,9 @@ def main_worker(rank: int, world_size: int):
                 break
 
             G.train(); D.train()
-            x = x.to(device, non_blocking=True)
+            x = x.to(device, non_blocking=True)                 # [B, T] waveform
+            x = norm_wave_per_sample(x)                         # *** stabilizare critică ***
+            x = safe_tensor(x)
 
             # ----- MIXUP SINCRONIZAT -----
             want_mix = data_rnd.random() < 0.3
@@ -214,24 +234,31 @@ def main_worker(rank: int, world_size: int):
                     perm = torch.empty(x.size(0), device=device, dtype=torch.long)
                 perm = broadcast_tensor(perm, world_size)
                 x = 0.7 * x + 0.3 * x[perm]
+                x = norm_wave_per_sample(x)                     # re-norm după mixup
+                x = safe_tensor(x)
 
-            # ----- forward G
-            with autocast(device_type='cuda', enabled=AMP_ENABLED):
-                y = G(x)
+            # ----- forward G (tanh pentru a menține [-1,1])
+            with autocast(device_type=('cuda' if device.type == 'cuda' else 'cpu'), enabled=AMP_ENABLED):
+                y_raw = G(x)                                    # [B, T]
+                y = torch.tanh(y_raw)                           # *** principal anti-NaN ***
+                y = safe_tensor(y)
 
             # ----- D train (WGAN + lazy R1)
             for _ in range(CRITIC_ITERS):
                 optD.zero_grad(set_to_none=True)
-                with autocast(device_type='cuda', enabled=AMP_ENABLED):
+                with autocast(device_type=('cuda' if device.type == 'cuda' else 'cpu'), enabled=AMP_ENABLED):
                     xr = x.unsqueeze(1)
                     xf = y.detach().unsqueeze(1)
                     if inst_noise > 0.0:
                         xr = (xr + torch.randn_like(xr) * inst_noise).clamp(-1, 1)
                         xf = (xf + torch.randn_like(xf) * inst_noise).clamp(-1, 1)
+                    # safe
+                    xr = safe_tensor(xr); xf = safe_tensor(xf)
                     sr, fr = D(xr)
                     sf, ff = D(xf)
                     lossD = d_loss_wgan(sr, sf)
 
+                # R1 doar periodic (fp32, fără autocast)
                 r1 = torch.tensor(0.0, device=device)
                 if (global_step % R1_EVERY) == 0:
                     xr_fp32 = x.unsqueeze(1).detach().requires_grad_(True)
@@ -239,19 +266,35 @@ def main_worker(rank: int, world_size: int):
                     r1 = r1_penalty(xr_fp32, sr_r1).clamp(max=1e3)
 
                 lossD_total = lossD + LAMBDA_R1 * r1
+
+                # protecție anti-NaN
+                if not isfinite_tensor(lossD_total):
+                    # micșorăm puțin bruiajul & delta și sărim pasul D
+                    inst_noise = max(INST_NOISE_MIN, inst_noise * 0.99)
+                    delta = max(DELTA_MIN, delta * 0.99)
+                    continue
+
                 scalerD.scale(lossD_total).backward()
+                # grad clip
+                try:
+                    scalerD.unscale_(optD)
+                    torch.nn.utils.clip_grad_norm_(D.parameters(), GRAD_CLIP if GRAD_CLIP and GRAD_CLIP > 0 else 5.0)
+                except Exception:
+                    pass
                 scalerD.step(optD); scalerD.update()
 
             # ----- G train
             optG.zero_grad(set_to_none=True)
-            with autocast(device_type='cuda', enabled=AMP_ENABLED):
+            with autocast(device_type=('cuda' if device.type == 'cuda' else 'cpu'), enabled=AMP_ENABLED):
                 sr_fake, ff_fake = D(y.unsqueeze(1))
                 lossG_gan = g_loss_wgan(sr_fake) * LAMBDA_GAN
 
+                # spectrale
                 loss_mrstft = mrstft(y, x)
-                mel_x = mel_feat(x); mel_y = mel_feat(y)
-                loss_mel = torch.nn.functional.l1_loss(safe(mel_y), safe(mel_x))
+                mel_x = safe(mel_feat(x)); mel_y = safe(mel_feat(y))
+                loss_mel = torch.nn.functional.l1_loss(mel_y, mel_x)
 
+                # feature matching
                 with torch.no_grad():
                     sr_real, ff_real = D(x.unsqueeze(1))
                 loss_fm = feature_matching_loss(ff_real, ff_fake) * LAMBDA_FM
@@ -271,10 +314,19 @@ def main_worker(rank: int, world_size: int):
 
                 lossG_total = lossG_gan + loss_spec + loss_fm + loss_evasion
 
+            # protecție anti-NaN
+            if not isfinite_tensor(lossG_total):
+                inst_noise = max(INST_NOISE_MIN, inst_noise * 0.99)
+                delta = max(DELTA_MIN, delta * 0.99)
+                continue
+
             scalerG.scale(lossG_total).backward()
             if GRAD_CLIP and GRAD_CLIP > 0:
-                scalerG.unscale_(optG)
-                torch.nn.utils.clip_grad_norm_(G.parameters(), GRAD_CLIP)
+                try:
+                    scalerG.unscale_(optG)
+                    torch.nn.utils.clip_grad_norm_(G.parameters(), GRAD_CLIP)
+                except Exception:
+                    pass
             scalerG.step(optG); scalerG.update()
 
             if ema is not None:
@@ -283,9 +335,9 @@ def main_worker(rank: int, world_size: int):
             # ----- Surrogate update: DOAR rank-0 (rar)
             if is_main(rank) and (surrogate is not None) and (global_step % SURROGATE_UPDATE_EVERY == 0):
                 with torch.no_grad():
-                    mel_y_det = mel_feat(y.detach())
+                    mel_y_det = safe(mel_feat(y.detach()))
                 try:
-                    if detwrap is not None:
+                    if detwrap is not None and hasattr(detwrap, "keras_prob"):
                         keras_np = detwrap.keras_prob(y.detach().cpu())
                         keras_t = torch.from_numpy(keras_np).float().to(device)
                         optS.zero_grad(set_to_none=True)
@@ -303,28 +355,39 @@ def main_worker(rank: int, world_size: int):
 
             # ----- Logging (rank-0)
             if is_main(rank) and (global_step % LOG_INTERVAL == 0):
-                if LOG_WITH_KERAS and detwrap is not None:
-                    p_bona = detwrap.keras_prob(y.detach().cpu())
-                    p_bona_mean = float(np.mean(p_bona))
+                if LOG_WITH_KERAS and detwrap is not None and hasattr(detwrap, "keras_prob"):
+                    try:
+                        p_bona = detwrap.keras_prob(y.detach().cpu())
+                        p_bona_mean = float(np.mean(p_bona))
+                    except Exception:
+                        p_bona_mean = 0.0
                 else:
                     with torch.no_grad():
                         if surrogate is not None:
-                            logits = surrogate(mel_feat(y.detach()))
+                            logits = surrogate(safe(mel_feat(y.detach())))
                             p_bona_mean = float(torch.sigmoid(logits).mean().item())
                         else:
                             p_bona_mean = 0.0
 
+                # toate valorile din log sunt finite
+                def fnum(v):
+                    if isinstance(v, torch.Tensor):
+                        v = float(v.detach().cpu().item())
+                    if not np.isfinite(v):
+                        return 0.0
+                    return float(v)
+
                 row = {
-                    "step": global_step, "epoch": epoch,
-                    "lossD": float(lossD_total.detach().cpu().item()),
-                    "lossG": float(lossG_total.detach().cpu().item()),
-                    "loss_gan": float((lossG_gan.detach().cpu().item())),
-                    "loss_spec": float((loss_spec.detach().cpu().item())),
-                    "loss_fm": float((loss_fm.detach().cpu().item())),
-                    "loss_evasion": float((loss_evasion.detach().cpu().item())) if isinstance(loss_evasion, torch.Tensor) else float(loss_evasion),
+                    "step": int(global_step), "epoch": int(epoch),
+                    "lossD": fnum(lossD_total),
+                    "lossG": fnum(lossG_total),
+                    "loss_gan": fnum(lossG_gan),
+                    "loss_spec": fnum(loss_spec),
+                    "loss_fm": fnum(loss_fm),
+                    "loss_evasion": fnum(loss_evasion),
                     "inst_noise": float(inst_noise), "delta": float(delta),
                     "lambda_evasion": float(lambda_evasion),
-                    "p_bona_mean": p_bona_mean,
+                    "p_bona_mean": float(p_bona_mean),
                 }
                 append_csv_row(Path(LOG_CSV), row)
                 p_window.append(p_bona_mean)
