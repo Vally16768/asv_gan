@@ -1,4 +1,4 @@
-# train.py — DDP single-node multi-GPU, AMP, EMA, early-stop 80% bona_fide, tqdm progress
+# train.py — tuned WGAN training loop with lazy R1, stronger critic, TTUR, surrogate updates
 from __future__ import annotations
 import os, math, time, random
 from pathlib import Path
@@ -17,13 +17,14 @@ from constants import (
     ROOT, SAVE_DIR, CKPT_DIR, LOG_CSV, SAMPLES_DIR,
     AMP_ENABLED, BATCH_SIZE, EPOCHS, NUM_WORKERS, PIN_MEMORY,
     LR_G, LR_D, BETA1, BETA2, WEIGHT_DECAY, CRITIC_ITERS, GRAD_CLIP,
-    LAMBDA_GAN, LAMBDA_SPEC, LAMBDA_FM, LAMBDA_R1,
+    LAMBDA_GAN, LAMBDA_SPEC, LAMBDA_FM, LAMBDA_R1, R1_EVERY,
     DELTA_INIT, DELTA_MIN, DELTA_DECAY,
     INST_NOISE_INIT, INST_NOISE_MIN, INST_NOISE_DECAY,
     EVASION_WARMUP_STEPS, EVASION_RAMP_STEPS, LAMBDA_EVASION_MAX,
     LOG_INTERVAL, SAVE_AUDIO_EVERY_EPOCH,
     SEED, SR, USE_EMA, EMA_DECAY,
     USE_SURROGATE, SURROGATE_LR, SURROGATE_BETA1, SURROGATE_BETA2, SURROGATE_W,
+    SURROGATE_UPDATE_EVERY,
     TARGET_P_BONA, TARGET_WINDOW, MIN_STEPS_TO_CHECK, MAX_TRAIN_STEPS
 )
 from dataset import ASVBonafideDataset, pad_collate
@@ -98,8 +99,8 @@ def main_worker(rank: int, world_size: int):
     mrstft = MRSTFTLoss().to(device)
     ema = EMA(G, decay=EMA_DECAY) if (USE_EMA and is_main(rank)) else None
 
-    # Surrogate + Keras detector (TF on CPU, auto from ./ASVmodel)
-    surrogate = SurrogateDetector(mel_bins=mel_feat.mel.n_mels, hidden=1024).to(device) if USE_SURROGATE else None
+    # Surrogate + Keras detector (TF on CPU)
+    surrogate = SurrogateDetector(mel_bins=mel_feat.mel.n_mels, hidden=2048).to(device) if USE_SURROGATE else None
     detwrap = DetectorWrapper()  # Keras ASV on CPU
 
     # DDP wrap
@@ -109,7 +110,7 @@ def main_worker(rank: int, world_size: int):
         if surrogate is not None:
             surrogate = torch.nn.parallel.DistributedDataParallel(surrogate, device_ids=[rank], output_device=rank, broadcast_buffers=False)
 
-    # Optims
+    # Optims (TTUR)
     optG = optim.AdamW(G.parameters(), lr=LR_G, betas=(BETA1, BETA2), weight_decay=WEIGHT_DECAY)
     optD = optim.AdamW(D.parameters(), lr=LR_D, betas=(BETA1, BETA2), weight_decay=WEIGHT_DECAY)
     optS = optim.Adam(surrogate.parameters(), lr=SURROGATE_LR, betas=(SURROGATE_BETA1, SURROGATE_BETA2)) if surrogate is not None else None
@@ -148,7 +149,7 @@ def main_worker(rank: int, world_size: int):
             with autocast(device_type='cuda', enabled=AMP_ENABLED):
                 y = G(x)  # [B,T]
 
-            # -------- D train (WGAN-R1)
+            # -------- D train (WGAN-R1) with lazy R1
             for _ in range(CRITIC_ITERS):
                 optD.zero_grad(set_to_none=True)
                 with autocast(device_type='cuda', enabled=AMP_ENABLED):
@@ -165,9 +166,14 @@ def main_worker(rank: int, world_size: int):
                     sf, ff = D(xf)
                     lossD = d_loss_wgan(sr, sf)
 
-                    xr.requires_grad_(True)
-                    sr_r1, _ = D(xr)
-                    r1 = r1_penalty(xr, sr_r1).clamp(max=1e3)
+                    # lazy R1: compute only every R1_EVERY steps
+                    r1 = torch.tensor(0.0, device=device)
+                    if (global_step % R1_EVERY) == 0:
+                        xr.requires_grad_(True)
+                        sr_r1, _ = D(xr)
+                        r1_val = r1_penalty(xr, sr_r1).clamp(max=1e3)
+                        r1 = r1_val
+
                     lossD_total = lossD + LAMBDA_R1 * r1
 
                 scaler.scale(lossD_total).backward()
@@ -214,12 +220,11 @@ def main_worker(rank: int, world_size: int):
             if ema is not None:
                 ema.update(G.module if hasattr(G, "module") else G)
 
-            # -------- Surrogate training (Keras pe CPU)
-            if (surrogate is not None) and (global_step % 5 == 0):
+            # -------- Surrogate training (Keras on CPU) — periodic
+            if (surrogate is not None) and (global_step % SURROGATE_UPDATE_EVERY == 0):
                 with torch.no_grad():
                     mel_y_det = mel_feat(y.detach())
                 try:
-                    # fiecare rank își calculează ținta; DDP va face all-reduce pe gradienți
                     keras_np = detwrap.keras_prob(y.detach().cpu())
                     keras_t = torch.from_numpy(keras_np).float().to(device)
                     optS.zero_grad(set_to_none=True)
@@ -228,7 +233,9 @@ def main_worker(rank: int, world_size: int):
                     loss_sur.backward()
                     optS.step()
                 except Exception as e:
-                    raise RuntimeError(f"[ASVmodel] Eroare la scorarea Keras: {e}")
+                    # don't fail training because of intermittent ASV scoring issues
+                    if is_main(rank):
+                        print(f"[ASVmodel] Surrogate update skipped: {e}")
 
             # -------- schedules
             inst_noise = max(INST_NOISE_MIN, inst_noise * INST_NOISE_DECAY)

@@ -135,7 +135,7 @@ class Generator(nn.Module):
 
 # ----------------- Multi-Scale Discriminator (3-scale) -----------------
 class Critic1D(nn.Module):
-    def __init__(self, in_ch=1, base=32):
+    def __init__(self, in_ch=1, base=64):
         super().__init__()
         ch = base
         self.net = nn.ModuleList([
@@ -167,9 +167,10 @@ class Critic1D(nn.Module):
 class MultiScaleCritic(nn.Module):
     def __init__(self):
         super().__init__()
-        self.d1 = Critic1D(base=32)
-        self.d2 = Critic1D(base=32)
-        self.d3 = Critic1D(base=32)
+        # stronger critics (base increased)
+        self.d1 = Critic1D(base=64)
+        self.d2 = Critic1D(base=64)
+        self.d3 = Critic1D(base=64)
         self.avgpool = nn.AvgPool1d(4, 2, 1)
 
     def forward(self, x):
@@ -187,7 +188,7 @@ class MultiScaleCritic(nn.Module):
 
 # ----------------- Optional Surrogate Detector -----------------
 class SurrogateDetector(nn.Module):
-    def __init__(self, mel_bins=160, hidden=1024):
+    def __init__(self, mel_bins=160, hidden=2048):
         super().__init__()
         in_dim = mel_bins * 2  # mean + std pooling
         self.net = nn.Sequential(

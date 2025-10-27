@@ -1,3 +1,4 @@
+# constants.py — tuned for stronger WGAN training (defensive / research)
 from pathlib import Path
 
 # ----------------- Audio / Features -----------------
@@ -28,30 +29,33 @@ AMP_ENABLED = True            # mixed precision for speed/stability
 BATCH_SIZE = 6
 EPOCHS = 1000                 # high cap; early stopping will typically stop earlier
 
-# TTUR (Two Time-scale)
-LR_G = 1.5e-4
-LR_D = 8e-5
+# TTUR (Two Time-scale) — D slightly faster than G
+LR_G = 1e-4
+LR_D = 2e-4
 BETA1 = 0.0
 BETA2 = 0.99
 WEIGHT_DECAY = 0.0
 
-CRITIC_ITERS = 1
+# More critic updates initially -> stronger critic signal
+CRITIC_ITERS = 3
 GRAD_CLIP = 5.0
 
 # Loss weights
 LAMBDA_GAN  = 1.0
 LAMBDA_SPEC = 3.0
 LAMBDA_FM   = 1.0
-LAMBDA_R1   = 0.25
+# stronger R1 regularization (applied lazily)
+LAMBDA_R1   = 10.0
+R1_EVERY    = 16
 
 # Schedules for instance noise & dithering (applied to inputs of D / spectrograms)
 DELTA_INIT  = 0.02
 DELTA_MIN   = 0.002
-DELTA_DECAY = 0.9995
+DELTA_DECAY = 0.9999  # slower decay
 
 INST_NOISE_INIT  = 0.02
 INST_NOISE_MIN   = 0.0
-INST_NOISE_DECAY = 0.9995
+INST_NOISE_DECAY = 0.9999  # slower decay to stabilize longer
 
 # Evasion warm-up
 EVASION_WARMUP_STEPS = 5000
@@ -82,6 +86,7 @@ SURROGATE_LR = 2e-4
 SURROGATE_BETA1 = 0.9
 SURROGATE_BETA2 = 0.999
 SURROGATE_W = 1.0  # weight inside evasion term
+SURROGATE_UPDATE_EVERY = 5  # how often to update surrogate (global steps)
 
 # Early stop target (ASV bona_fide probability)
 TARGET_P_BONA = 0.80
@@ -92,11 +97,8 @@ MIN_STEPS_TO_CHECK = 2000 # don't consider early stopping earlier than this many
 MAX_TRAIN_STEPS = 5_000_000
 
 # ----------------- ASVspoof strict adapter (infer_ahkmno source of truth) -----------------
-# Combo de litere pentru vectorul de intrare al modelului Keras (ex. "AHKMNO")
 ASV_COMBO = "AHKMNO"
-# Calea implicită pentru scaler (dacă există) din folderul modelului Keras:
 ASV_MODEL_PATH = ROOT / "ASVmodel" / "best_model.keras"
 ASV_SCALER_PATH = ROOT / "ASVmodel" / "scaler.pkl"
-# Director temporar pentru wav-urile intermediare (evităm coliziuni în DDP):
 ASV_TMP_DIR = SAVE_DIR / "_tmp_asv"
 ASV_TMP_DIR.mkdir(parents=True, exist_ok=True)
