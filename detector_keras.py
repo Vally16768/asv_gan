@@ -4,65 +4,141 @@ from pathlib import Path
 import pickle
 import numpy as np
 
-# Silențiază TF și forțează CPU (ca să nu consume GPU-ul PyTorch)
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
-from constants import ROOT
+# --- config & roots ---
+try:
+    from constants import ROOT  # and maybe ASV_MODEL_PATH if you add it
+except Exception:
+    ROOT = Path(__file__).resolve().parent
+
 ASV_DIR = Path(ROOT) / "ASVmodel"
 
+# Keras/TensorFlow on CPU
 try:
     import tensorflow as tf
     try:
-        # Ascunde toate GPU-urile din perspectiva TF
         tf.config.set_visible_devices([], "GPU")
     except Exception:
         pass
 except Exception as e:
     raise ImportError(
-        "TensorFlow/Keras nu este disponibil. Instalează-l (pip install tensorflow)."
+        "TensorFlow/Keras nu este disponibil. Instalează-l (ex: `pip install tensorflow`)."
     ) from e
+
+
+def _find_saved_model_dir(base: Path) -> Path | None:
+    # Caută un folder SavedModel (conține saved_model.pb)
+    for p in base.iterdir():
+        if p.is_dir() and (p / "saved_model.pb").exists():
+            return p
+    return None
+
+
+def _first(globs: list[Path]) -> Path | None:
+    for g in globs:
+        if g.exists():
+            return g
+    return None
 
 
 class KerasASV:
     """
-    Încarcă obligatoriu modelul Keras din ./ASVmodel și face scoring pe CPU.
-    Adaptează automat dimensiunea vectorului de intrare (ex. 320 -> 61) prin
-    interpolare liniară pe axa de features.
-
-    Structura așteptată:
-      ./ASVmodel/
-        - best_model.keras sau best_model.h5   (obligatoriu)
-        - labels.txt                           (opțional, pt. index bona_fide)
-        - scaler.pkl                           (opțional)
-        - feature_order.txt                    (opțional, informativ)
+    Loader + inferență pentru modelul Keras din ./ASVmodel.
+    Noutăți:
+      - mod STRICT: fără interpolare/resize; verifică dimensiunea de intrare
+      - predict_prob_bonafide_prepared(X): pentru input deja pregătit (ex. asv_adapter)
+      - auto-detectează modelul: .keras, .h5, sau SavedModel
+      - permite cale explicită prin env ASV_MODEL_PATH sau constantă (dacă e definită în constants.py)
     """
-    def __init__(self, loader_fn=None):
+    def __init__(self, loader_fn=None, strict: bool = True):
+        # 1) Custom loader (dacă e oferit)
         if loader_fn is not None:
             self.model = loader_fn()
         else:
             self.model = self._auto_load_model()
 
         # input dim din model (ex. 61)
-        self.input_dim = int(self.model.input_shape[-1])
+        self.input_shape = self.model.input_shape
+        self.input_dim = int(self.input_shape[-1])
 
         self.scaler = self._maybe_load_scaler()
         self.bona_index = self._infer_bona_index()
         self.feature_order = self._maybe_load_feature_order()
 
+        self.strict = strict  # dacă True, nu facem resize la intrare
+
     # ---------- loaders ----------
     def _auto_load_model(self):
-        if not ASV_DIR.exists():
-            raise FileNotFoundError(f"[ASVmodel] Director inexistent: {ASV_DIR}")
-        model_path = None
-        if (ASV_DIR / "best_model.keras").exists():
-            model_path = ASV_DIR / "best_model.keras"
-        elif (ASV_DIR / "best_model.h5").exists():
-            model_path = ASV_DIR / "best_model.h5"
-        else:
+        # 0) Cale explicită prin ENV sau constants.ASV_MODEL_PATH
+        env_path = os.getenv("ASV_MODEL_PATH")
+        const_path = None
+        try:
+            from constants import ASV_MODEL_PATH as CONST_MODEL_PATH  # optional
+            const_path = CONST_MODEL_PATH
+        except Exception:
+            pass
+
+        candidates = []
+        if env_path:
+            candidates.append(Path(env_path))
+        if const_path:
+            candidates.append(Path(const_path))
+
+        # 1) Preferă .h5 (compat Keras v2/v3) când coexistă cu .keras
+        h5 = ASV_DIR / "best_model.h5"
+        kf = ASV_DIR / "best_model.keras"
+        if h5.exists():
+            candidates.append(h5)
+        if kf.exists():
+            candidates.append(kf)
+
+        # 2) Alte fișiere din director
+        #   - întâi .h5, apoi .keras
+        for p in sorted(ASV_DIR.glob("*.h5")):
+            if p not in candidates:
+                candidates.append(p)
+        for p in sorted(ASV_DIR.glob("*.keras")):
+            if p not in candidates:
+                candidates.append(p)
+
+        # 3) SavedModel directory (conține saved_model.pb)
+        for p in ASV_DIR.iterdir():
+            if p.is_dir() and (p / "saved_model.pb").exists():
+                candidates.append(p)
+
+        if not candidates:
             raise FileNotFoundError(
-                f"[ASVmodel] Lipsă model: {ASV_DIR/'best_model.keras'} sau {ASV_DIR/'best_model.h5'}."
+                "Nu am găsit niciun model în ./ASVmodel. Pune best_model.h5 sau setează ASV_MODEL_PATH."
             )
-        return tf.keras.models.load_model(str(model_path))
+
+        last_err = None
+        for c in candidates:
+            try:
+                mdl = tf.keras.models.load_model(str(c))
+                print(f"[KerasASV] Loaded model from: {c}")
+                return mdl
+            except Exception as e:
+                last_err = e
+                # fallback special: dacă extensia e .keras dar pare HDF5, încearcă din nou ca HDF5
+                try:
+                    if c.suffix == ".keras" and (c.with_suffix(".h5")).exists():
+                        alt = c.with_suffix(".h5")
+                        mdl = tf.keras.models.load_model(str(alt))
+                        print(f"[KerasASV] Loaded model from (fallback .h5): {alt}")
+                        return mdl
+                except Exception:
+                    pass
+                continue
+
+        # dacă am ajuns aici, toate încercările au eșuat
+        raise RuntimeError(
+            "Eșec la încărcarea modelului Keras. Verifică formatul fișierului:\n"
+            " - Dacă e HDF5, păstrează extensia .h5\n"
+            " - Dacă e noul format Keras 3, extensia trebuie .keras (zip)\n"
+            f"Ultima eroare: {last_err}"
+        )
+
 
     def _maybe_load_scaler(self):
         p = ASV_DIR / "scaler.pkl"
@@ -99,10 +175,9 @@ class KerasASV:
                 pass
         return None
 
-    # ---------- preprocessing ----------
+    # ---------- preprocessing (legacy / non-strict) ----------
     @staticmethod
     def _interp_1d(vec: np.ndarray, out_dim: int) -> np.ndarray:
-        """Interpolează un vector 1D la dimensiunea out_dim."""
         D = vec.shape[0]
         if D == out_dim:
             return vec
@@ -111,11 +186,6 @@ class KerasASV:
         return np.interp(new, old, vec).astype(np.float32)
 
     def _resize_features(self, X: np.ndarray) -> np.ndarray:
-        """
-        X: [B, Din] -> [B, self.input_dim] prin interpolare liniară pe axa de features.
-        Dacă ai nevoie de un mapping specific (după feature_order.txt),
-        putem implementa un selector; momentan folosim o re-eșantionare robustă.
-        """
         B, Din = X.shape
         if Din == self.input_dim:
             return X.astype(np.float32, copy=False)
@@ -125,35 +195,41 @@ class KerasASV:
         return out
 
     def _prepare(self, feats_np: np.ndarray) -> np.ndarray:
-        # 1) adaptează dimensiunea la ce așteaptă modelul Keras
+        if self.strict:
+            if feats_np.shape[1] != self.input_dim:
+                raise ValueError(f"[ASVmodel] STRICT mismatch: X={feats_np.shape[1]} vs model={self.input_dim}")
+            return feats_np.astype(np.float32, copy=False)
         X = self._resize_features(feats_np)
-        # 2) (opțional) scaler din .pkl
         if self.scaler is not None:
             try:
                 X = self.scaler.transform(X)
             except Exception:
-                # dacă scalerul nu se potrivește, continuăm fără să oprim antrenarea
                 pass
         return X
 
     # ---------- inference ----------
-    def predict_prob_bonafide(self, feats_np: np.ndarray) -> np.ndarray:
-        """
-        feats_np: [B, D] (ex. concat(mean, std) din mel) — orice D.
-        Returnează: [B] probabilități bona_fide.
-        """
-        if self.model is None:
-            raise RuntimeError("[ASVmodel] Modelul Keras nu este încărcat.")
-        X = self._prepare(feats_np)
-        preds = self.model.predict(X, verbose=0)
+    def _post(self, preds) -> np.ndarray:
         p = np.array(preds)
-
         if p.ndim == 2:
-            # logits/prob multiclasă
             ex = np.exp(p - p.max(axis=1, keepdims=True))
             prob = ex / ex.sum(axis=1, keepdims=True)
             idx = min(self.bona_index, prob.shape[1] - 1)
             return prob[:, idx].astype(np.float32)
-
-        # deja [B] probabilități
         return p.reshape(-1).astype(np.float32)
+
+    def predict_prob_bonafide(self, feats_np: np.ndarray) -> np.ndarray:
+        X = self._prepare(feats_np)
+        preds = self.model.predict(X, verbose=0)
+        return self._post(preds)
+
+    def predict_prob_bonafide_prepared(self, X: np.ndarray, strict_dim: bool = True, apply_scaler: bool = False) -> np.ndarray:
+        X = np.asarray(X, dtype=np.float32)
+        if strict_dim and X.shape[1] != self.input_dim:
+            raise ValueError(f"[ASVmodel] STRICT mismatch: X={X.shape[1]} vs model={self.input_dim}")
+        if apply_scaler and self.scaler is not None:
+            try:
+                X = self.scaler.transform(X)
+            except Exception:
+                pass
+        preds = self.model.predict(X, verbose=0)
+        return self._post(preds)

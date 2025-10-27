@@ -90,3 +90,13 @@ MIN_STEPS_TO_CHECK = 2000 # don't consider early stopping earlier than this many
 
 # Safety caps
 MAX_TRAIN_STEPS = 5_000_000
+
+# ----------------- ASVspoof strict adapter (infer_ahkmno source of truth) -----------------
+# Combo de litere pentru vectorul de intrare al modelului Keras (ex. "AHKMNO")
+ASV_COMBO = "AHKMNO"
+# Calea implicită pentru scaler (dacă există) din folderul modelului Keras:
+ASV_MODEL_PATH = ROOT / "ASVmodel" / "best_model.keras"
+ASV_SCALER_PATH = ROOT / "ASVmodel" / "scaler.pkl"
+# Director temporar pentru wav-urile intermediare (evităm coliziuni în DDP):
+ASV_TMP_DIR = SAVE_DIR / "_tmp_asv"
+ASV_TMP_DIR.mkdir(parents=True, exist_ok=True)
