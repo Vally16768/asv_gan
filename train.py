@@ -1,6 +1,7 @@
-# train.py — tuned WGAN training loop with lazy R1, stronger critic, TTUR, surrogate updates
+# train.py — tuned WGAN training loop with dual GradScalers (fix for CRITIC_ITERS>1),
+# stronger critic, TTUR, lazy R1, surrogate updates, and robust dataset roots (glob by ext).
 from __future__ import annotations
-import os, math, time, random
+import os, random
 from pathlib import Path
 from collections import deque
 import numpy as np
@@ -39,6 +40,7 @@ from detector_wrapper import DetectorWrapper
 
 torch.backends.cudnn.benchmark = True
 
+
 # ----------------- helpers -----------------
 def set_seed(seed: int):
     import numpy as _np
@@ -58,8 +60,14 @@ class EMA:
             self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
 
 def ddp_state_dict(m: nn.Module):
-    # compat: DDP.module vs. bare module
     return m.module.state_dict() if hasattr(m, "module") else m.state_dict()
+
+def build_roots_patterns() -> list[str]:
+    """Returnează pattern-uri recursive pentru extensii audio comune în database/data."""
+    base = (ROOT / "database" / "data").resolve()
+    exts = ["flac", "wav", "mp3", "ogg", "m4a"]
+    return [str(base / "**" / f"*.{e}") for e in exts]
+
 
 # ----------------- DDP launcher -----------------
 def main():
@@ -71,21 +79,27 @@ def main():
     else:
         main_worker(0, 1)
 
+
 def main_worker(rank: int, world_size: int):
     set_seed(SEED + rank)
-    torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
-
-    # DDP init (single node)
     if world_size > 1:
+        torch.cuda.set_device(rank)
         dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
     # I/O
-    os.makedirs(SAVE_DIR, exist_ok=True); os.makedirs(CKPT_DIR, exist_ok=True); os.makedirs(SAMPLES_DIR, exist_ok=True)
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    os.makedirs(CKPT_DIR, exist_ok=True)
+    os.makedirs(SAMPLES_DIR, exist_ok=True)
 
-    # Data + sampler
-    train_ds = ASVBonafideDataset(roots=[str((ROOT / "database" / "data" / "**" / "*.flac").resolve())])
-    sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True) if world_size > 1 else None
+    # ----------------- Data + sampler (FIXED ROOTS) -----------------
+    # ASVBonafideDataset se așteaptă la o listă de patterns/paths care duc la fișiere.
+    # Îi dăm glob-uri recursive pentru mai multe extensii, ca să nu pice dacă nu ai .flac.
+    roots = build_roots_patterns()
+    train_ds = ASVBonafideDataset(roots=roots)
+
+    sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank,
+                                 shuffle=True, drop_last=True) if world_size > 1 else None
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=(sampler is None),
         sampler=sampler, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
@@ -99,9 +113,9 @@ def main_worker(rank: int, world_size: int):
     mrstft = MRSTFTLoss().to(device)
     ema = EMA(G, decay=EMA_DECAY) if (USE_EMA and is_main(rank)) else None
 
-    # Surrogate + Keras detector (TF on CPU)
+    # Surrogate + Keras detector (TF/CPU via wrapper)
     surrogate = SurrogateDetector(mel_bins=mel_feat.mel.n_mels, hidden=2048).to(device) if USE_SURROGATE else None
-    detwrap = DetectorWrapper()  # Keras ASV on CPU
+    detwrap = DetectorWrapper()  # Keras ASV (CPU)
 
     # DDP wrap
     if world_size > 1:
@@ -115,15 +129,17 @@ def main_worker(rank: int, world_size: int):
     optD = optim.AdamW(D.parameters(), lr=LR_D, betas=(BETA1, BETA2), weight_decay=WEIGHT_DECAY)
     optS = optim.Adam(surrogate.parameters(), lr=SURROGATE_LR, betas=(SURROGATE_BETA1, SURROGATE_BETA2)) if surrogate is not None else None
 
-    scaler = GradScaler(enabled=AMP_ENABLED)
+    # Dual scalers: unul pentru D (multiple steps per iter), unul pentru G
+    scalerD = GradScaler(enabled=AMP_ENABLED)
+    scalerG = GradScaler(enabled=AMP_ENABLED)
 
     global_step = 0
     inst_noise = INST_NOISE_INIT
     delta = DELTA_INIT
     best_metric = -1.0
+    lambda_evasion = 0.0  # default pentru logging
 
     if is_main(rank):
-        # print model sizes once
         print(f"Params G: {count_params(G)/1e6:.2f}M, D: {count_params(D)/1e6:.2f}M, Surrogate: {(count_params(surrogate)/1e6 if surrogate else 0):.2f}M")
 
     p_window = deque(maxlen=TARGET_WINDOW)
@@ -140,7 +156,7 @@ def main_worker(rank: int, world_size: int):
             G.train(); D.train()
             x = x.to(device, non_blocking=True)  # [B,T]
 
-            # mic mixup pt. diversitate
+            # ușor mixup pt. diversitate
             if random.random() < 0.3:
                 perm = torch.randperm(x.size(0), device=device)
                 x = 0.7 * x + 0.3 * x[perm]
@@ -149,7 +165,7 @@ def main_worker(rank: int, world_size: int):
             with autocast(device_type='cuda', enabled=AMP_ENABLED):
                 y = G(x)  # [B,T]
 
-            # -------- D train (WGAN-R1) with lazy R1
+            # -------- D train (WGAN-R1) with Lazy R1 & scalerD
             for _ in range(CRITIC_ITERS):
                 optD.zero_grad(set_to_none=True)
                 with autocast(device_type='cuda', enabled=AMP_ENABLED):
@@ -166,27 +182,28 @@ def main_worker(rank: int, world_size: int):
                     sf, ff = D(xf)
                     lossD = d_loss_wgan(sr, sf)
 
-                    # lazy R1: compute only every R1_EVERY steps
-                    r1 = torch.tensor(0.0, device=device)
-                    if (global_step % R1_EVERY) == 0:
-                        xr.requires_grad_(True)
-                        sr_r1, _ = D(xr)
-                        r1_val = r1_penalty(xr, sr_r1).clamp(max=1e3)
-                        r1 = r1_val
+                # lazy R1 în FP32
+                r1 = torch.tensor(0.0, device=device)
+                if (global_step % R1_EVERY) == 0:
+                    xr_fp32 = x.unsqueeze(1).detach().requires_grad_(True)
+                    sr_r1, _ = D(xr_fp32)  # FP32
+                    r1_val = r1_penalty(xr_fp32, sr_r1).clamp(max=1e3)
+                    r1 = r1_val
 
-                    lossD_total = lossD + LAMBDA_R1 * r1
+                lossD_total = lossD + LAMBDA_R1 * r1
 
-                scaler.scale(lossD_total).backward()
-                scaler.step(optD)
+                scalerD.scale(lossD_total).backward()
+                scalerD.step(optD)
+                scalerD.update()
 
-            # -------- G train
+            # -------- G train (scalerG)
             optG.zero_grad(set_to_none=True)
             with autocast(device_type='cuda', enabled=AMP_ENABLED):
                 xf = y.unsqueeze(1)
                 sr_fake, ff_fake = D(xf)
                 lossG_gan = g_loss_wgan(sr_fake) * LAMBDA_GAN
 
-                loss_mrstft = mrstft(y, x)
+                loss_mrstft = MRSTFTLoss().to(device)(y, x)  # mică alocare locală sigură
                 mel_x = mel_feat(x)
                 mel_y = mel_feat(y)
                 loss_mel = torch.nn.functional.l1_loss(safe(mel_y), safe(mel_x))
@@ -196,11 +213,12 @@ def main_worker(rank: int, world_size: int):
                 loss_fm = feature_matching_loss(ff_real, ff_fake) * LAMBDA_FM
                 loss_spec = (loss_mrstft + loss_mel) * LAMBDA_SPEC
 
+                # schedule evasion
                 if global_step < EVASION_WARMUP_STEPS:
                     lambda_evasion = 0.0
                 else:
                     t = min(1.0, (global_step - EVASION_WARMUP_STEPS) / max(1, EVASION_RAMP_STEPS))
-                    lambda_evasion = LAMBDA_EVASION_MAX * t
+                    lambda_evasion = float(LAMBDA_EVASION_MAX * t)
 
                 loss_evasion = torch.tensor(0.0, device=device)
                 if (surrogate is not None) and (lambda_evasion > 0):
@@ -209,18 +227,18 @@ def main_worker(rank: int, world_size: int):
 
                 lossG_total = lossG_gan + loss_spec + loss_fm + loss_evasion
 
-            scaler.scale(lossG_total).backward()
+            scalerG.scale(lossG_total).backward()
             if GRAD_CLIP and GRAD_CLIP > 0:
-                scaler.unscale_(optG)
+                scalerG.unscale_(optG)
                 torch.nn.utils.clip_grad_norm_(G.parameters(), GRAD_CLIP)
-            scaler.step(optG)
-            scaler.update()
+            scalerG.step(optG)
+            scalerG.update()
 
-            # EMA doar pe rank-0 (shadow e dictionar de state-dicts CPU)
+            # EMA doar pe rank-0
             if ema is not None:
                 ema.update(G.module if hasattr(G, "module") else G)
 
-            # -------- Surrogate training (Keras on CPU) — periodic
+            # -------- Surrogate training (periodic, target = Keras prob bona_fide)
             if (surrogate is not None) and (global_step % SURROGATE_UPDATE_EVERY == 0):
                 with torch.no_grad():
                     mel_y_det = mel_feat(y.detach())
@@ -233,11 +251,10 @@ def main_worker(rank: int, world_size: int):
                     loss_sur.backward()
                     optS.step()
                 except Exception as e:
-                    # don't fail training because of intermittent ASV scoring issues
                     if is_main(rank):
                         print(f"[ASVmodel] Surrogate update skipped: {e}")
 
-            # -------- schedules
+            # -------- Schedules
             inst_noise = max(INST_NOISE_MIN, inst_noise * INST_NOISE_DECAY)
             delta = max(DELTA_MIN, delta * DELTA_DECAY)
 
@@ -251,10 +268,10 @@ def main_worker(rank: int, world_size: int):
                     "step": global_step, "epoch": epoch,
                     "lossD": float(lossD_total.detach().cpu().item()),
                     "lossG": float(lossG_total.detach().cpu().item()),
-                    "loss_gan": float(lossG_gan.detach().cpu().item()),
-                    "loss_spec": float(loss_spec.detach().cpu().item()),
-                    "loss_fm": float(loss_fm.detach().cpu().item()),
-                    "loss_evasion": float(loss_evasion.detach().cpu().item()) if isinstance(loss_evasion, torch.Tensor) else float(loss_evasion),
+                    "loss_gan": float((lossG_gan.detach().cpu().item())),
+                    "loss_spec": float((loss_spec.detach().cpu().item())),
+                    "loss_fm": float((loss_fm.detach().cpu().item())),
+                    "loss_evasion": float((loss_evasion.detach().cpu().item())) if isinstance(loss_evasion, torch.Tensor) else float(loss_evasion),
                     "inst_noise": float(inst_noise), "delta": float(delta),
                     "lambda_evasion": float(lambda_evasion),
                     "p_bona_mean": p_bona_mean,
@@ -274,7 +291,6 @@ def main_worker(rank: int, world_size: int):
                     torch.save(state, Path(CKPT_DIR) / "best.pth")
                     tqdm.write(f"[{global_step}] New best p_bona_mean = {best_metric:.4f} -> saved best.pth")
 
-                # tqdm line
                 pbar.set_postfix({
                     "p_bona": f"{p_bona_mean:.3f}",
                     "lossG": f"{lossG_total.item():.3f}",
@@ -309,13 +325,11 @@ def main_worker(rank: int, world_size: int):
 
         # end epoch
         if is_main(rank):
-            # sample audio
             if SAVE_AUDIO_EVERY_EPOCH:
                 with torch.no_grad():
-                    wav_demo = y[0].detach().cpu()
-                    save_wave(Path(SAMPLES_DIR) / f"ep{epoch:03d}_fake.wav", wav_demo, SR)
+                    save_wave(Path(SAMPLES_DIR) / f"ep{epoch:03d}_fake.wav", y[0].detach().cpu(), SR)
                     save_wave(Path(SAMPLES_DIR) / f"ep{epoch:03d}_real.wav", x[0].detach().cpu(), SR)
-            # save epoch ckpt
+
             ckpt_path = Path(CKPT_DIR) / f"epoch{epoch:03d}.pth"
             state = {"G": ddp_state_dict(G), "D": ddp_state_dict(D), "step": global_step, "epoch": epoch}
             if ema is not None:
@@ -325,6 +339,7 @@ def main_worker(rank: int, world_size: int):
 
     if world_size > 1:
         dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     main()
