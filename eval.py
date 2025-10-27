@@ -1,4 +1,4 @@
-
+# eval.py — preferă G_EMA dacă e disponibil în checkpoint
 import torch
 from pathlib import Path
 from constants import SR, SAVE_DIR, CKPT_DIR, SAMPLES_DIR
@@ -10,7 +10,11 @@ from detector_wrapper import DetectorWrapper
 @torch.no_grad()
 def load_ckpt(model, ckpt_path):
     sd = torch.load(ckpt_path, map_location="cpu")
-    if "state_dict" in sd:
+    if "G_EMA" in sd:
+        sd = sd["G_EMA"]
+    elif "G" in sd:
+        sd = sd["G"]
+    elif "state_dict" in sd:
         sd = sd["state_dict"]
     missing, unexpected = model.load_state_dict(sd, strict=False)
     if len(missing):
@@ -30,11 +34,9 @@ def evaluate_sample(ckpt="best.pth", wav: torch.Tensor = None, keras_loader_fn=N
     x = wav.unsqueeze(0).to(device)
 
     y = G(x).squeeze(0).cpu()
-    # Save
     outp = Path(SAMPLES_DIR) / "eval_out.wav"
     save_wave(outp, y, SR)
 
-    # Keras score
     det = DetectorWrapper(keras_loader_fn=keras_loader_fn)
     p = det.keras_prob(y.unsqueeze(0))
     print("ASV bona_fide prob:", float(p.mean()))

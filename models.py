@@ -1,4 +1,4 @@
-
+# models.py — fixed UNet wiring (concat channels) + clean decoder order
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -64,12 +64,12 @@ class Generator(nn.Module):
 
         downs, ups = [], []
         ch = base
-        skips = []
+        self.skip_channels = []
         # encoder
-        for i in range(depth):
-            downs.append(DownBlock(ch, ch*2))
+        for _ in range(depth):
+            downs.append(DownBlock(ch, ch * 2))
             ch *= 2
-            skips.append(ch)
+            self.skip_channels.append(ch)
         self.downs = nn.ModuleList(downs)
 
         # bottleneck
@@ -79,9 +79,9 @@ class Generator(nn.Module):
             ResBlock1D(ch, k=3, dilation=9),
         )
 
-        # decoder
-        for i in range(depth):
-            ups.append(UpBlock(ch, ch//2))
+        # decoder: expect concat (ch + ch_skip) => 2*ch in
+        for _ in range(depth):
+            ups.append(UpBlock(in_ch=ch * 2, out_ch=ch // 2))
             ch //= 2
         self.ups = nn.ModuleList(ups)
 
@@ -99,11 +99,15 @@ class Generator(nn.Module):
             x = d(x)
             feats.append(x)
         x = self.bot(x)
-        for u in self.ups[::-1]:
-            skip = feats.pop()
+
+        # go back up in the same order as we created 'ups'
+        for u in self.ups:
+            skip = feats.pop()  # last encoder feature (matches current 'x' scale)
+            # align lengths (safety for odd lengths)
             x = F.interpolate(x, size=skip.size(-1), mode='nearest')
-            x = torch.cat([x, skip], dim=1)
+            x = torch.cat([x, skip], dim=1)  # channels double here
             x = u(x)
+
         delta = self.outp(x).squeeze(1)
         return (wav + 0.5 * delta).clamp(-1, 1)
 
@@ -135,8 +139,7 @@ class Critic1D(nn.Module):
             h = layer(h)
             feats.append(h)
         out = self.head(h)  # [B,1,T']
-        # global pooling for scalar score (WGAN)
-        score = out.mean(dim=[1,2])
+        score = out.mean(dim=[1, 2])  # WGAN scalar
         return score, feats
 
 class MultiScaleCritic(nn.Module):
@@ -147,7 +150,6 @@ class MultiScaleCritic(nn.Module):
         self.avgpool = nn.AvgPool1d(4, 2, 1)
 
     def forward(self, x):
-        # x: [B,1,T]
         s1 = x
         s2 = self.avgpool(x)
         s = []
@@ -156,10 +158,10 @@ class MultiScaleCritic(nn.Module):
             sc, feats = d(inp)
             s.append(sc)
             f.append(feats)
-        score = torch.stack(s, dim=0).mean(dim=0)  # average critics
-        return score, f  # list of feats per scale
+        score = torch.stack(s, dim=0).mean(dim=0)
+        return score, f
 
-# ----------------- Optional Surrogate Detector (for differentiable evasion) -----------------
+# ----------------- Optional Surrogate Detector -----------------
 class SurrogateDetector(nn.Module):
     def __init__(self, mel_bins=128, hidden=512):
         super().__init__()
@@ -167,9 +169,9 @@ class SurrogateDetector(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.ReLU(),
-            nn.Linear(hidden, hidden//2),
+            nn.Linear(hidden, hidden // 2),
             nn.ReLU(),
-            nn.Linear(hidden//2, 1),  # logits for bona_fide
+            nn.Linear(hidden // 2, 1),  # logits for bona_fide
         )
 
     def forward(self, mel):  # mel: [B, M, Tm]

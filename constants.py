@@ -3,6 +3,10 @@ from pathlib import Path
 
 # ----------------- Audio / Features -----------------
 SR = 16000
+# lungimea maximă a unui exemplu în antrenare
+MAX_AUDIO_SECONDS = 3
+SEGMENT_SAMPLES   = MAX_AUDIO_SECONDS * SR
+
 N_MELS = 128
 N_FFT = 1024
 HOP_LENGTH = 160      # 10 ms @ 16k
@@ -22,7 +26,7 @@ SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ----------------- Training -----------------
 AMP_ENABLED = True            # mixed precision for speed/stability
-BATCH_SIZE = 24
+BATCH_SIZE = 8
 EPOCHS = 200
 
 # TTUR (stabil)

@@ -1,4 +1,4 @@
-
+# train.py — torch.amp autocast/GradScaler API (no FutureWarning)
 from __future__ import annotations
 import os, time, json, math
 from pathlib import Path
@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
+from torch.amp import autocast, GradScaler  # NEW
 
 from constants import (
     ROOT, SAVE_DIR, CKPT_DIR, LOG_CSV, SAMPLES_DIR,
@@ -72,7 +73,7 @@ def main():
 
     # Surrogate & Keras detector
     surrogate = SurrogateDetector().to(device) if USE_SURROGATE else None
-    detwrap = DetectorWrapper(keras_loader_fn=None)  # Plug your loader here if available
+    detwrap = DetectorWrapper(keras_loader_fn=None)  # plug your ASV loader if available
 
     # Optims
     optG = optim.AdamW(G.parameters(), lr=LR_G, betas=(BETA1, BETA2), weight_decay=WEIGHT_DECAY)
@@ -81,7 +82,7 @@ def main():
     if surrogate is not None:
         optS = optim.Adam(surrogate.parameters(), lr=SURROGATE_LR, betas=(SURROGATE_BETA1, SURROGATE_BETA2))
 
-    scaler = torch.cuda.amp.GradScaler(enabled=AMP_ENABLED)
+    scaler = GradScaler('cuda', enabled=AMP_ENABLED)  # NEW
 
     global_step = 0
     inst_noise = INST_NOISE_INIT
@@ -96,13 +97,13 @@ def main():
             x = x.to(device)  # [B,T]
 
             # Forward G
-            with torch.cuda.amp.autocast(enabled=AMP_ENABLED):
+            with autocast('cuda', enabled=AMP_ENABLED):  # NEW
                 y = G(x)  # enhanced wave
 
             # Train D (WGAN-R1)
             for _ in range(CRITIC_ITERS):
                 optD.zero_grad(set_to_none=True)
-                with torch.cuda.amp.autocast(enabled=AMP_ENABLED):
+                with autocast('cuda', enabled=AMP_ENABLED):  # NEW
                     xr = x.unsqueeze(1)
                     xf = y.detach().unsqueeze(1)
 
@@ -126,10 +127,10 @@ def main():
 
                 scaler.scale(lossD_total).backward()
                 scaler.step(optD)
-                # no scaler.update() here to keep single update/iter
+
             # Train G
             optG.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=AMP_ENABLED):
+            with autocast('cuda', enabled=AMP_ENABLED):  # NEW
                 xf = y.unsqueeze(1)
                 sr_fake, ff_fake = D(xf)
                 lossG_gan = g_loss_wgan(sr_fake) * LAMBDA_GAN
@@ -182,7 +183,6 @@ def main():
                 keras_t = torch.from_numpy(keras_np).float().to(device)
                 optS.zero_grad(set_to_none=True)
                 logits = surrogate(mel_y_det)
-                # BCE to match keras prob
                 loss_sur = torch.nn.functional.binary_cross_entropy_with_logits(logits, keras_t)
                 loss_sur.backward()
                 optS.step()
@@ -193,7 +193,6 @@ def main():
 
             if global_step % LOG_INTERVAL == 0:
                 with torch.no_grad():
-                    # metric: keras bona_fide prob on current batch fake
                     try:
                         p_bona = detwrap.keras_prob(y.detach().cpu())
                         p_bona_mean = float(np.mean(p_bona))
@@ -243,7 +242,6 @@ def main():
         ckpt_path = Path(CKPT_DIR) / f"epoch{epoch:03d}.pth"
         state = {"G": G.state_dict(), "D": D.state_dict(), "step": global_step, "epoch": epoch}
         if ema is not None:
-            # store EMA weights separately
             state["G_EMA"] = ema.shadow
         torch.save(state, ckpt_path)
 
