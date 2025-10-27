@@ -1,89 +1,34 @@
-# detector_wrapper.py — device-aware Mel everywhere
-from typing import Union
+
 import torch
-import torchaudio
+import numpy as np
+from features import LogMel
+from constants import FEATS_MEAN, FEATS_STD
+from detector_keras import KerasASV
 
-from constants import SR, N_MELS, N_FFT, HOP_LENGTH, WIN_LENGTH
-
-_mel_transform = torchaudio.transforms.MelSpectrogram(
-    sample_rate=SR,
-    n_fft=N_FFT,
-    hop_length=HOP_LENGTH,
-    win_length=WIN_LENGTH,
-    n_mels=N_MELS,
-    power=1.0,
-)
-
-def wave_to_mel(wave: torch.Tensor) -> torch.Tensor:
-    # acceptă [T], [1,T], [B,1,T], [B,T]
-    if wave.dim() == 1:
-        wave = wave.unsqueeze(0)
-    if wave.dim() == 3 and wave.size(1) == 1:
-        wave = wave.squeeze(1)
-    mel = _mel_transform.to(wave.device)(wave)  # <<< fix device
-    mel = torch.log1p(torch.clamp(mel, min=0.0))
-    return mel
-
-class DetectorWrapper(torch.nn.Module):
+class DetectorWrapper:
     """
-    Wrapper generic pentru detectoare PyTorch (nn.Module or TorchScript).
-    Acceptă:
-      - model: torch.nn.Module / ScriptModule ce primește mel sau waveform și returnează scoruri
-      - model: None -> returnează zeros
+    Provides:
+      - keras_prob(x): numpy-only, metric (no grads)
+      - torch_pooled(mel): torch pooled features (for surrogate)
     """
-    def __init__(self, model: torch.nn.Module | None = None):
-        super().__init__()
-        self.model = model
-        if self.model is not None:
-            try:
-                self.model.eval()
-            except Exception:
-                pass
+    def __init__(self, keras_loader_fn=None):
+        self.feats = LogMel()
+        self.keras = KerasASV(loader_fn=keras_loader_fn)
 
-    @staticmethod
-    def wave_to_mel(wave: torch.Tensor) -> torch.Tensor:
-        if wave.dim() == 1:
-            wave = wave.unsqueeze(0)
-        if wave.dim() == 3 and wave.size(1) == 1:
-            wave = wave.squeeze(1)
-        mel = _mel_transform.to(wave.device)(wave)  # <<< fix device
-        mel = torch.log1p(torch.clamp(mel, min=0.0))
-        return mel
+    @torch.no_grad()
+    def keras_prob(self, wave: torch.Tensor) -> np.ndarray:
+        # wave: [B,T] cpu/float
+        mel = self.feats(wave).cpu().numpy()  # [B,M,Tm]
+        mu = mel.mean(axis=-1)
+        sd = mel.std(axis=-1)
+        pooled = np.concatenate([mu, sd], axis=1)  # [B,2M]
+        # standardize if needed
+        pooled = (pooled - FEATS_MEAN) / max(1e-6, FEATS_STD) if isinstance(FEATS_STD, (int, float)) else pooled
+        return self.keras.predict_prob_bonafide(pooled)
 
-    def forward(self, x: Union[torch.Tensor, list]) -> torch.Tensor:
-        """
-        Acceptă waveform [B,1,T] sau mel [B,M,T] ori [T]/[B,T].
-        Dacă self.model este None -> întoarce zero-uri.
-        """
-        if torch.is_tensor(x):
-            if x.dim() == 3 and x.size(1) == N_MELS:
-                mel = x
-            elif x.dim() == 2:
-                # [B,T] posibil waveform -> fă mel
-                if x.size(1) > 1000:
-                    mel = self.wave_to_mel(x)
-                else:
-                    mel = x
-            elif x.dim() == 1:
-                mel = self.wave_to_mel(x.unsqueeze(0))
-            else:
-                mel = x
-        else:
-            raise ValueError("Unsupported input type for DetectorWrapper.forward")
-
-        if self.model is None:
-            return torch.zeros(mel.size(0), device=mel.device)
-
-        try:
-            out = self.model(mel)
-            return out.squeeze()
-        except Exception as e:
-            # fallback: poate modelul așteaptă waveform [B,1,T]
-            try:
-                wav_like = x if (torch.is_tensor(x) and x.dim() == 3 and x.size(1) == 1) else None
-                if wav_like is not None:
-                    out = self.model(wav_like)
-                    return out.squeeze()
-            except Exception:
-                pass
-            raise e
+    def torch_pooled(self, mel: torch.Tensor) -> torch.Tensor:
+        # mel: [B,M,Tm]
+        mu = mel.mean(dim=-1)
+        sd = mel.std(dim=-1)
+        pooled = torch.cat([mu, sd], dim=1)  # [B,2M]
+        return pooled

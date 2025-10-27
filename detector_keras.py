@@ -1,59 +1,34 @@
-# detector_keras.py
-from pathlib import Path
 
-def _keras_disable_gpu_and_threads():
-    try:
-        import tensorflow as tf
-        tf.config.set_visible_devices([], 'GPU')
-        tf.config.threading.set_intra_op_parallelism_threads(1)
-        tf.config.threading.set_inter_op_parallelism_threads(1)
-    except Exception:
-        pass
+# Thin wrapper to load a Keras/TensorFlow model for ASV scoring.
+# It is used as a metric and to supervise the surrogate detector (no gradients).
+import numpy as np
 
-def load_keras_model(model_path: Path):
-    """
-    Robust loader for Keras 3:
-    - Accepts new `.keras` (zip) OR legacy `.h5`
-    - Tries safe_mode=False for broader compatibility
-    - Falls back between keras and tf.keras
-    """
-    _keras_disable_gpu_and_threads()
-
-    path = Path(model_path)
-    if not path.exists():
-        # try sibling .h5 / .keras
-        alt = path.with_suffix(".h5") if path.suffix != ".h5" else path.with_suffix(".keras")
-        if alt.exists():
-            path = alt
+class KerasASV:
+    def __init__(self, loader_fn=None):
+        """
+        loader_fn: callable that returns a compiled Keras model with .predict()
+        You should implement loader_fn in your environment to load your ASV model.
+        """
+        if loader_fn is None:
+            self.model = None
         else:
-            raise FileNotFoundError(f"[ASV] Model file not found: {model_path} (also tried {alt})")
+            self.model = loader_fn()
 
-    # 1) Try keras >=3 API first
-    try:
-        import keras
-        try:
-            return keras.models.load_model(str(path), compile=False, safe_mode=False)
-        except TypeError:
-            # Older keras without safe_mode kw
-            return keras.models.load_model(str(path), compile=False)
-    except Exception as e1:
-        err1 = e1
-
-    # 2) Fallback to tf.keras
-    try:
-        import tensorflow as tf
-        try:
-            return tf.keras.models.load_model(str(path), compile=False, safe_mode=False)
-        except TypeError:
-            return tf.keras.models.load_model(str(path), compile=False)
-    except Exception as e2:
-        # Explain likely mismatch of extension vs format
-        raise RuntimeError(
-            f"[ASV] Failed to load Keras model from {path}.\n"
-            f"- keras.load_model error: {type(err1).__name__}: {err1}\n"
-            f"- tf.keras.load_model error: {type(e2).__name__}: {e2}\n"
-            f"Tips:\n"
-            f"  • If your file is legacy HDF5, ensure it has '.h5' extension (and install 'h5py').\n"
-            f"  • If it’s a new Keras v3 archive, use '.keras'.\n"
-            f"  • You currently have: suffix={path.suffix}"
-        )
+    def predict_prob_bonafide(self, feats_np: np.ndarray) -> np.ndarray:
+        """
+        feats_np: [B, D] pooled features (mean+std concat) or logits [B, C]
+        Returns: [B] prob of bona_fide.
+        """
+        if self.model is None:
+            # Fallback heuristic: 0.0 (very strict) so training relies on surrogate & recon losses.
+            return np.zeros((feats_np.shape[0],), dtype=np.float32)
+        preds = self.model.predict(feats_np, verbose=0)
+        p = np.array(preds)
+        if p.ndim == 2 and p.shape[1] >= 2:
+            # assume second column is bona_fide after softmax
+            # if not, adapt mapping here
+            ex = np.exp(p - p.max(axis=1, keepdims=True))
+            prob = ex / ex.sum(axis=1, keepdims=True)
+            return prob[:, 1].astype(np.float32)
+        # if already prob
+        return p.reshape(-1).astype(np.float32)

@@ -1,89 +1,62 @@
-# dataset.py
-from __future__ import annotations
-from pathlib import Path
-from typing import Dict, List
 
-import torch
-import soundfile as sf
-import torchaudio
+import torch, torchaudio, random
 from torch.utils.data import Dataset
-
+from pathlib import Path
+from typing import List
 from constants import DATA_DIR, SR
-from features import stack_asv_features
+import glob
 
-AUDIO_EXTS = {".wav", ".flac", ".mp3", ".m4a"}
-
-def _is_audio(p: Path) -> bool:
-    return p.suffix.lower() in AUDIO_EXTS
-
-def _scan(root: Path) -> List[Path]:
-    return [p for p in root.rglob("*") if p.is_file() and _is_audio(p)]
-
-def _read_audio(path: Path) -> torch.Tensor:
-    """Mono waveform [1, T] la SR."""
-    wav, sr = sf.read(str(path), dtype="float32", always_2d=False)
-    if wav.ndim == 2:
-        wav = wav.mean(axis=1)
-    w = torch.from_numpy(wav).view(1, -1)  # [1, T]
-    if sr != SR:
-        w = torchaudio.functional.resample(w, sr, SR)
-    return w
+def list_audio_files(paths):
+    files = []
+    for p in paths:
+        files.extend(glob.glob(str(p)))
+    files = [f for f in files if Path(f).suffix.lower() in {".wav", ".flac"}]
+    return sorted(files)
 
 class ASVBonafideDataset(Dataset):
     """
-    Returnează:
-      "wave":  [1, T]
-      "feats": [C, Tf]
+    Bonafide-only dataset. Loads waveforms, random crops to ~3s to 6s to add variability.
     """
-    def __init__(self, split: str = "train", data_dir: Path | None = None, use_validation: bool = True):
-        self.root = Path(data_dir) if data_dir else Path(DATA_DIR)
-        files = _scan(self.root)
-        if not files:
-            raise RuntimeError(f"No audio files (.wav/.flac/.mp3/.m4a) found under {self.root}")
+    def __init__(self, roots: List[str], segment_sec=(3.0, 6.0)):
+        super().__init__()
+        if not roots:
+            roots = [str(DATA_DIR / "**" / "*.flac")]
+        self.files = list_audio_files(roots)
+        self.segment_sec = segment_sec
+        if len(self.files) == 0:
+            raise RuntimeError(f"No audio found under: {roots}")
 
-        files = sorted(files)
-        if not use_validation:
-            # Folosește TOT setul pentru training (fără validare)
-            self.files = files
-        else:
-            n = len(files)
-            cut = max(1, int(0.9 * n))
-            self.files = files[:cut] if split == "train" else files[cut:]
-
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.files)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx):
         path = self.files[idx]
-        wave = _read_audio(path)           # [1, T]
-        feats = stack_asv_features(wave)   # [C, Tf]
-        if feats.dim() == 3 and feats.size(0) == 1:
-            feats = feats.squeeze(0)       # -> [C, T]
-        return {"wave": wave, "feats": feats}
+        wav, sr = torchaudio.load(path)
+        if wav.size(0) > 1:
+            wav = wav.mean(0, keepdim=True)
+        if sr != SR:
+            wav = torchaudio.functional.resample(wav, sr, SR)
 
-def pad_collate(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    """Padding pe axa timp pentru wave și features."""
-    # wave
-    max_Tw = max(x["wave"].size(-1) for x in batch)
-    waves = []
-    for x in batch:
-        w = x["wave"]
-        pad = max_Tw - w.size(-1)
-        if pad > 0:
-            w = torch.nn.functional.pad(w, (0, pad))
-        waves.append(w)
-    waves = torch.stack(waves, dim=0)  # [B,1,Tw]
+        wav = wav.squeeze(0)  # [T]
+        # random crop
+        min_s, max_s = self.segment_sec
+        seg_len = int(SR * random.uniform(min_s, max_s))
+        if wav.numel() < seg_len:
+            pad = seg_len - wav.numel()
+            wav = torch.nn.functional.pad(wav, (0, pad))
+        else:
+            start = random.randint(0, max(0, wav.numel() - seg_len))
+            wav = wav[start:start+seg_len]
+        wav = wav.clamp(-1, 1)
+        return wav, path
 
-    # feats
-    C = batch[0]["feats"].size(0)
-    max_Tf = max(x["feats"].size(-1) for x in batch)
-    feats = []
-    for x in batch:
-        f = x["feats"]
-        pad = max_Tf - f.size(-1)
-        if pad > 0:
-            f = torch.nn.functional.pad(f, (0, pad))
-        feats.append(f)
-    feats = torch.stack(feats, dim=0)  # [B,C,Tf]
-
-    return {"wave": waves, "feats": feats}
+def pad_collate(batch):
+    waves, paths = zip(*batch)
+    max_len = max(w.numel() for w in waves)
+    padded = []
+    for w in waves:
+        if w.numel() < max_len:
+            w = torch.nn.functional.pad(w, (0, max_len - w.numel()))
+        padded.append(w)
+    x = torch.stack(padded, dim=0)  # [B, T]
+    return x, list(paths)

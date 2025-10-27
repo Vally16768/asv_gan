@@ -1,22 +1,71 @@
-# losses.py
-from __future__ import annotations
+
 import torch
+from torch import nn
+import torch.nn.functional as F
+import math
+import torchaudio
 
-def wgan_g_loss(d_fake: torch.Tensor) -> torch.Tensor:
-    return -d_fake.mean()
+# ----------------- GAN losses (WGAN) -----------------
+def d_loss_wgan(real_scores, fake_scores):
+    # maximize real - fake -> minimize fake - real
+    return (fake_scores - real_scores).mean()
 
-def wgan_d_loss(d_real: torch.Tensor, d_fake: torch.Tensor) -> torch.Tensor:
-    return (d_fake.mean() - d_real.mean())
+def g_loss_wgan(fake_scores):
+    return (-fake_scores).mean()
 
-def r1_regularizer(d_real: torch.Tensor, x_real: torch.Tensor) -> torch.Tensor:
-    """
-    R1 penalty: ||∇_x D(x)||^2 pe real; d_real: [B], x_real: [B,C,T]
-    """
-    grads = torch.autograd.grad(
-        outputs=d_real.sum(),
-        inputs=x_real,
+# R1 penalty on real
+def r1_penalty(real_wave, real_scores):
+    # real_wave: [B,1,T] requires grad, real_scores: [B]
+    grad = torch.autograd.grad(
+        outputs=real_scores.sum(),
+        inputs=real_wave,
         create_graph=True,
         retain_graph=True,
         only_inputs=True
-    )[0]
-    return grads.pow(2).sum(dim=[1, 2]).mean()
+    )[0]  # [B,1,T]
+    penalty = grad.pow(2).reshape(grad.size(0), -1).sum(dim=1).mean()
+    return penalty
+
+# ----------------- Multi-Resolution STFT -----------------
+class MRSTFTLoss(nn.Module):
+    def __init__(self, fft_sizes=(512, 1024, 2048), hops=(160, 320, 640), wins=(400, 800, 1200)):
+        super().__init__()
+        self.fft_sizes = fft_sizes
+        self.hops = hops
+        self.wins = wins
+        self.window_cache = {}
+
+    def stft_mag(self, x, n_fft, hop, win):
+        key = (n_fft,)
+        if key not in self.window_cache:
+            self.window_cache[key] = torch.hann_window(win).to(x.device)
+        w = self.window_cache[key]
+        X = torch.stft(x, n_fft=n_fft, hop_length=hop, win_length=win, window=w, center=True, return_complex=True)
+        mag = torch.abs(X)
+        return mag
+
+    def forward(self, x, y):  # wave [B,T]
+        loss = 0.0
+        for n_fft, hop, win in zip(self.fft_sizes, self.hops, self.wins):
+            X = self.stft_mag(x, n_fft, hop, win)
+            Y = self.stft_mag(y, n_fft, hop, win)
+            loss += F.l1_loss(torch.log(X + 1e-6), torch.log(Y + 1e-6)) + F.l1_loss(X, Y)
+        return loss / len(self.fft_sizes)
+
+# ----------------- Feature Matching -----------------
+def feature_matching_loss(real_feats, fake_feats):
+    # real_feats / fake_feats: list[list[tensors]] per scale
+    tot = 0.0
+    count = 0
+    for rf_s, ff_s in zip(real_feats, fake_feats):
+        for r, f in zip(rf_s, ff_s):
+            tot += F.l1_loss(r, f)
+            count += 1
+    return tot / max(1, count)
+
+# ----------------- Evasion Loss (with surrogate) -----------------
+def evasion_loss_from_logits(bona_logits, weight=1.0):
+    # We want bona_fide, so maximize sigmoid(logits) => minimize BCE with target 1
+    target = torch.ones_like(bona_logits)
+    loss = F.binary_cross_entropy_with_logits(bona_logits, target)
+    return weight * loss

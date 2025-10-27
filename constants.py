@@ -1,64 +1,81 @@
-# constants.py — „long-run, natural + ASV evasion” profile
+
 from pathlib import Path
 
-# ----------------- Audio & featuri -----------------
-SR         = 16000
-N_MELS     = 128
-N_FFT      = 1024
+# ----------------- Audio / Features -----------------
+SR = 16000
+N_MELS = 128
+N_FFT = 1024
 HOP_LENGTH = 160      # 10 ms @ 16k
 WIN_LENGTH = 400      # 25 ms @ 16k
+FMIN = 20
+FMAX = 7600
+POWER = 1.0           # magnitude spectrogram power for mel
+
 FEATS_MEAN = 0.0
 FEATS_STD  = 1.0
 
-ROOT     = Path(__file__).resolve().parent
+# Paths
+ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "database" / "data"
-
-# ----------------- Antrenare (long-run) -----------------
-AMP_ENABLED  = True          # activăm AMP pentru viteză pe run lung
-BATCH_SIZE   = 24
-EPOCHS       = 200           # long-run; poți opri prin early stopping
-CRITIC_ITERS = 3             # un pic mai mare => D mai solid, dar fără să domine
-
-# TTUR (stabil & ușor pro-G)
-LR_G  = 1.0e-4
-LR_D  = 1.5e-4
-BETA1 = 0.0
-BETA2 = 0.99
-
-# ----------------- Ponderi pierderi -----------------
-LAMBDA_GAN  = 1.0
-LAMBDA_SPEC = 20.0           # calitate/naturalness; înainte era 2.0
-LAMBDA_R1   = 0.5            # regularizare D, nu prea mare
-
-# ----------------- Delta (perturbația pe log-mel) -----------------
-# Mai multă libertate la început + decay mai lent => G învață semnale utile fără artefacte bruște
-DELTA_INIT = 0.03
-DELTA_MIN  = 0.01
-DELTA_DECAY = 0.9997         # per step (lent)
-
-# ----------------- Instance noise (stabilizează D) -----------------
-INST_NOISE_INIT  = 0.12
-INST_NOISE_MIN   = 0.02
-INST_NOISE_DECAY = 0.998     # per step (persistă mai mult)
-
-# ----------------- Early stopping -----------------
-EARLY_STOP_ENABLED  = True
-EARLY_STOP_PATIENCE = 25         # epoci fără îmbunătățire
-EARLY_STOP_METRIC   = "val_spec" # urmărim consistența spectrală pe val
-
-# ----------------- Logging / Val -----------------
-LOG_INTERVAL = 100
-VAL_INTERVAL = 1500              # pe pași; pentru „best” robust
-SAVE_DIR = ROOT / "checkpoints"
+SAVE_DIR = ROOT / "runs"
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
-# ----------------- ASVspoof (black-box evasion) -----------------
-ASV_MODEL_DIR = ROOT / "ASVmodel"   # conține best_model.keras/.h5 + labels.txt
-ASV_SCALER    = ASV_MODEL_DIR / "scaler.pkl"
-ASV_COMBO     = "AHKMNO"
-ASV_SR        = SR
+# ----------------- Training -----------------
+AMP_ENABLED = True            # mixed precision for speed/stability
+BATCH_SIZE = 24
+EPOCHS = 200
 
-# Evasion suficient de prezent, dar nu sufocant; la 1–2 pași din 2
-EVASION_LAMBDA = 0.6               # direcționează G contra ASV, dar lasă loc calității
-EVASION_EVERY  = 2                 # nu la fiecare pas -> mai natural
-TARGET_LABEL   = "bonafide"
+# TTUR (stabil)
+LR_G = 1.2e-4
+LR_D = 1.5e-4
+BETA1 = 0.0
+BETA2 = 0.99
+WEIGHT_DECAY = 0.0
+
+CRITIC_ITERS = 1             # keep D in check with strong MS architecture
+GRAD_CLIP = 5.0              # clip G grads for stability (None to disable)
+
+# Loss weights
+LAMBDA_GAN  = 1.0
+LAMBDA_SPEC = 2.0            # MR-STFT + log-mel has stronger pull
+LAMBDA_FM   = 5.0e-1         # feature matching from D
+LAMBDA_R1   = 0.25           # R1 penalty (on real) for WGAN
+
+# Schedules for instance noise & dithering (applied to inputs of D / spectrograms)
+DELTA_INIT  = 0.02
+DELTA_MIN   = 0.002
+DELTA_DECAY = 0.995
+
+INST_NOISE_INIT  = 0.02
+INST_NOISE_MIN   = 0.0
+INST_NOISE_DECAY = 0.995
+
+# Evasion warm-up
+EVASION_WARMUP_STEPS = 3000
+EVASION_RAMP_STEPS   = 6000
+LAMBDA_EVASION_MAX   = 0.7
+
+# Logging / saving
+LOG_INTERVAL = 100
+VAL_INTERVAL = 999999999  # set very large if you do not use validation for now
+SAVE_AUDIO_EVERY_EPOCH = True
+SAMPLES_DIR = SAVE_DIR / "samples"
+CKPT_DIR    = SAVE_DIR / "checkpoints"
+LOG_CSV     = SAVE_DIR / "train_log.csv"
+BEST_BY     = "p_bona_mean"  # or "lossG_val" if using validation
+
+# Misc
+SEED = 1337
+NUM_WORKERS = 6
+PIN_MEMORY = True
+
+# EMA
+USE_EMA = True
+EMA_DECAY = 0.999
+
+# Surrogate ASV (optional but recommended)
+USE_SURROGATE = True
+SURROGATE_LR = 2e-4
+SURROGATE_BETA1 = 0.9
+SURROGATE_BETA2 = 0.999
+SURROGATE_W = 1.0  # loss weight inside evasion term
