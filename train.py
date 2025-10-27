@@ -1,13 +1,16 @@
-# train.py — torch.amp autocast/GradScaler API (no FutureWarning)
+# train.py — main training loop with early stop by ASV bona_fide % (rolling)
 from __future__ import annotations
-import os, time, json, math
+import os, time, math, importlib
 from pathlib import Path
+import random
+from collections import deque
 import numpy as np
+import argparse
 
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
-from torch.amp import autocast, GradScaler  # NEW
+from torch.amp import autocast, GradScaler
 
 from constants import (
     ROOT, SAVE_DIR, CKPT_DIR, LOG_CSV, SAMPLES_DIR,
@@ -20,10 +23,11 @@ from constants import (
     LOG_INTERVAL, SAVE_AUDIO_EVERY_EPOCH,
     SEED, SR, USE_EMA, EMA_DECAY,
     USE_SURROGATE, SURROGATE_LR, SURROGATE_BETA1, SURROGATE_BETA2, SURROGATE_W,
+    TARGET_P_BONA, TARGET_WINDOW, MIN_STEPS_TO_CHECK, MAX_TRAIN_STEPS
 )
 
 from dataset import ASVBonafideDataset, pad_collate
-from models import Generator, MultiScaleCritic, SurrogateDetector
+from models import Generator, MultiScaleCritic, SurrogateDetector, SelfAttention1D  # SelfAttention1D included for completeness
 from losses import (
     d_loss_wgan, g_loss_wgan, r1_penalty,
     MRSTFTLoss, feature_matching_loss, evasion_loss_from_logits
@@ -35,8 +39,10 @@ from detector_wrapper import DetectorWrapper
 torch.backends.cudnn.benchmark = True
 
 def set_seed(seed):
-    import random, numpy as np
-    torch.manual_seed(seed); random.seed(seed); np.random.seed(seed)
+    import numpy as _np
+    random.seed(seed)
+    torch.manual_seed(seed)
+    _np.random.seed(seed)
 
 class EMA:
     def __init__(self, model, decay=0.999):
@@ -52,7 +58,30 @@ class EMA:
     def copy_to(self, model):
         model.load_state_dict(self.shadow, strict=True)
 
+def load_keras_loader(keras_loader_spec: str):
+    """
+    keras_loader_spec: "module.path:function_name"
+    returns callable or None
+    """
+    if not keras_loader_spec:
+        return None
+    if ":" in keras_loader_spec:
+        module_name, fn_name = keras_loader_spec.split(":", 1)
+    elif "." in keras_loader_spec:
+        module_name, fn_name = keras_loader_spec.rsplit(".", 1)
+    else:
+        raise ValueError("keras-loader must be module:function or module.fn")
+    mod = importlib.import_module(module_name)
+    fn = getattr(mod, fn_name)
+    return fn
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--keras-loader", type=str, default=None,
+                        help="Optional: module:function that returns compiled keras model (for ASV scoring). Example: my_asv.loader:load_model")
+    parser.add_argument("--max-steps", type=int, default=MAX_TRAIN_STEPS)
+    args = parser.parse_args()
+
     set_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(SAVE_DIR, exist_ok=True); os.makedirs(CKPT_DIR, exist_ok=True); os.makedirs(SAMPLES_DIR, exist_ok=True)
@@ -72,38 +101,51 @@ def main():
     ema = EMA(G, decay=EMA_DECAY) if USE_EMA else None
 
     # Surrogate & Keras detector
-    surrogate = SurrogateDetector().to(device) if USE_SURROGATE else None
-    detwrap = DetectorWrapper(keras_loader_fn=None)  # plug your ASV loader if available
+    surrogate = SurrogateDetector(mel_bins=mel_feat.mel.n_mels, hidden=1024).to(device) if USE_SURROGATE else None
+    keras_loader_fn = load_keras_loader(args.keras_loader)
+    detwrap = DetectorWrapper(keras_loader_fn=keras_loader_fn)
 
-    # Optims
+    # Optims (TTUR)
     optG = optim.AdamW(G.parameters(), lr=LR_G, betas=(BETA1, BETA2), weight_decay=WEIGHT_DECAY)
     optD = optim.AdamW(D.parameters(), lr=LR_D, betas=(BETA1, BETA2), weight_decay=WEIGHT_DECAY)
     optS = None
     if surrogate is not None:
         optS = optim.Adam(surrogate.parameters(), lr=SURROGATE_LR, betas=(SURROGATE_BETA1, SURROGATE_BETA2))
 
-    scaler = GradScaler('cuda', enabled=AMP_ENABLED)  # NEW
+    scaler = GradScaler(enabled=AMP_ENABLED)
 
     global_step = 0
     inst_noise = INST_NOISE_INIT
     delta = DELTA_INIT
 
     print(f"Params G: {count_params(G)/1e6:.2f}M, D: {count_params(D)/1e6:.2f}M, Surrogate: {(count_params(surrogate)/1e6 if surrogate else 0):.2f}M")
+    print("Using Keras loader:", bool(keras_loader_fn))
+    if not keras_loader_fn:
+        print("WARNING: no keras loader supplied — early stopping by ASV won't be active. Use --keras-loader module:fn")
 
-    best_metric = -1.0  # p_bona_mean; higher is better
+    # rolling window for p_bona_mean values (from logs)
+    p_window = deque(maxlen=TARGET_WINDOW)
+    best_metric = -1.0
+    best_step = 0
+
     for epoch in range(1, EPOCHS + 1):
         for it, (x, paths) in enumerate(train_loader):
             G.train(); D.train()
             x = x.to(device)  # [B,T]
 
+            # small feature mixup augment occasionally
+            if random.random() < 0.3:
+                perm = torch.randperm(x.size(0))
+                x = 0.7 * x + 0.3 * x[perm]
+
             # Forward G
-            with autocast('cuda', enabled=AMP_ENABLED):  # NEW
+            with autocast(enabled=AMP_ENABLED):
                 y = G(x)  # enhanced wave
 
             # Train D (WGAN-R1)
             for _ in range(CRITIC_ITERS):
                 optD.zero_grad(set_to_none=True)
-                with autocast('cuda', enabled=AMP_ENABLED):  # NEW
+                with autocast(enabled=AMP_ENABLED):
                     xr = x.unsqueeze(1)
                     xf = y.detach().unsqueeze(1)
 
@@ -122,6 +164,8 @@ def main():
                     xr.requires_grad_(True)
                     sr_r1, _ = D(xr)
                     r1 = r1_penalty(xr, sr_r1)
+                    # clamp r1 to avoid explosion
+                    r1 = torch.clamp(r1, max=1e3)
 
                     lossD_total = lossD + LAMBDA_R1 * r1
 
@@ -130,7 +174,7 @@ def main():
 
             # Train G
             optG.zero_grad(set_to_none=True)
-            with autocast('cuda', enabled=AMP_ENABLED):  # NEW
+            with autocast(enabled=AMP_ENABLED):
                 xf = y.unsqueeze(1)
                 sr_fake, ff_fake = D(xf)
                 lossG_gan = g_loss_wgan(sr_fake) * LAMBDA_GAN
@@ -141,11 +185,10 @@ def main():
                 mel_y = mel_feat(y)
                 loss_mel = torch.nn.functional.l1_loss(safe(mel_y), safe(mel_x))
 
-                # Feature matching
+                # Feature matching (use D-real features)
                 with torch.no_grad():
                     sr_real, ff_real = D(x.unsqueeze(1))
                 loss_fm = feature_matching_loss(ff_real, ff_fake) * LAMBDA_FM
-
                 loss_spec = (loss_mrstft + loss_mel) * LAMBDA_SPEC
 
                 # Evasion warm-up schedule
@@ -179,18 +222,23 @@ def main():
                 with torch.no_grad():
                     mel_y_det = mel_feat(y.detach())
                 pooled = detwrap.torch_pooled(mel_y_det).detach()
-                keras_np = detwrap.keras_prob(y.detach().cpu())
-                keras_t = torch.from_numpy(keras_np).float().to(device)
-                optS.zero_grad(set_to_none=True)
-                logits = surrogate(mel_y_det)
-                loss_sur = torch.nn.functional.binary_cross_entropy_with_logits(logits, keras_t)
-                loss_sur.backward()
-                optS.step()
+                try:
+                    keras_np = detwrap.keras_prob(y.detach().cpu())
+                    keras_t = torch.from_numpy(keras_np).float().to(device)
+                    optS.zero_grad(set_to_none=True)
+                    logits = surrogate(mel_y_det)
+                    loss_sur = torch.nn.functional.binary_cross_entropy_with_logits(logits, keras_t)
+                    loss_sur.backward()
+                    optS.step()
+                except Exception as e:
+                    # don't crash training if keras model fails
+                    print("Warning: surrogate training failed:", str(e))
 
             # Schedules
             inst_noise = max(INST_NOISE_MIN, inst_noise * INST_NOISE_DECAY)
             delta = max(DELTA_MIN, delta * DELTA_DECAY)
 
+            # Logging & CSV
             if global_step % LOG_INTERVAL == 0:
                 with torch.no_grad():
                     try:
@@ -202,52 +250,68 @@ def main():
                 row = {
                     "step": global_step,
                     "epoch": epoch,
-                    "lossD": float(lossD_total.detach().cpu().item()),
+                    "lossD": float(lossD_total.detach().cpu().item()) if 'lossD_total' in locals() else 0.0,
                     "lossG": float(lossG_total.detach().cpu().item()),
                     "loss_gan": float(lossG_gan.detach().cpu().item()),
                     "loss_spec": float(loss_spec.detach().cpu().item()),
                     "loss_fm": float(loss_fm.detach().cpu().item()),
-                    "loss_evasion": float(loss_evasion.detach().cpu().item()),
+                    "loss_evasion": float(loss_evasion.detach().cpu().item()) if isinstance(loss_evasion, torch.Tensor) else float(loss_evasion),
                     "inst_noise": float(inst_noise),
                     "delta": float(delta),
                     "lambda_evasion": float(lambda_evasion),
                     "p_bona_mean": p_bona_mean,
                 }
                 append_csv_row(Path(LOG_CSV), row)
+                p_window.append(p_bona_mean)
+
+                # update best
+                if p_bona_mean > best_metric:
+                    best_metric = p_bona_mean
+                    best_step = global_step
+                    # save best
+                    state = {"G": G.state_dict(), "D": D.state_dict(), "step": global_step, "epoch": epoch}
+                    if ema is not None:
+                        state["G_EMA"] = ema.shadow
+                    torch.save(state, Path(CKPT_DIR) / "best.pth")
+                    print(f"[{global_step}] New best p_bona_mean = {best_metric:.4f} -> saved best.pth")
+
+                print(f"step={global_step} epoch={epoch} it={it} p_bona_mean={p_bona_mean:.4f} lossG={lossG_total.item():.4f} lossD={lossD_total.item() if 'lossD_total' in locals() else 0.0:.4f}")
 
             global_step += 1
 
-        # end epoch
-        if SAVE_AUDIO_EVERY_EPOCH:
-            with torch.no_grad():
-                wav_demo = y[0].detach().cpu()
-                save_wave(Path(SAMPLES_DIR) / f"ep{epoch:03d}_fake.wav", wav_demo, SR)
-                save_wave(Path(SAMPLES_DIR) / f"ep{epoch:03d}_real.wav", x[0].detach().cpu(), SR)
+            # Save small demo audio frequently
+            if SAVE_AUDIO_EVERY_EPOCH and (global_step % (LOG_INTERVAL * 10) == 0):
+                try:
+                    with torch.no_grad():
+                        wav_demo = y[0].detach().cpu()
+                        save_wave(Path(SAMPLES_DIR) / f"step{global_step:07d}_fake.wav", wav_demo, SR)
+                        save_wave(Path(SAMPLES_DIR) / f"step{global_step:07d}_real.wav", x[0].detach().cpu(), SR)
+                except Exception as e:
+                    print("Warning: saving sample failed:", e)
 
-        # Save ckpt and track best by p_bona_mean (last logged)
-        try:
-            is_best = False
-            if Path(LOG_CSV).exists():
-                import pandas as pd
-                df = pd.read_csv(LOG_CSV)
-                if len(df) > 0:
-                    cur = float(df.iloc[-1]["p_bona_mean"])
-                    if cur > best_metric:
-                        best_metric = cur
-                        is_best = True
-        except Exception:
-            pass
+            # Early stopping check: require keras loader to be present and a stable rolling mean
+            if global_step >= MIN_STEPS_TO_CHECK and len(p_window) == TARGET_WINDOW and keras_loader_fn is not None:
+                rolling_mean = float(np.mean(p_window))
+                if rolling_mean >= TARGET_P_BONA:
+                    print(f"EARLY STOP: rolling_mean {rolling_mean:.4f} >= target {TARGET_P_BONA:.2f} (step {global_step})")
+                    # save final checkpoint
+                    final_state = {"G": G.state_dict(), "D": D.state_dict(), "step": global_step, "epoch": epoch}
+                    if ema is not None:
+                        final_state["G_EMA"] = ema.shadow
+                    torch.save(final_state, Path(CKPT_DIR) / f"final_step{global_step:07d}.pth")
+                    print("Saved final checkpoint. Exiting training loop.")
+                    return
 
-        # Save current
+            if global_step >= args.max_steps:
+                print("Reached max steps. Exiting.")
+                return
+
+        # end of epoch: save epoch ckpt
         ckpt_path = Path(CKPT_DIR) / f"epoch{epoch:03d}.pth"
         state = {"G": G.state_dict(), "D": D.state_dict(), "step": global_step, "epoch": epoch}
         if ema is not None:
             state["G_EMA"] = ema.shadow
         torch.save(state, ckpt_path)
-
-        if is_best:
-            best_path = Path(CKPT_DIR) / "best.pth"
-            torch.save(state, best_path)
 
     print("Training done. Best p_bona_mean =", best_metric)
 

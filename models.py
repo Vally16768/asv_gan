@@ -1,4 +1,4 @@
-# models.py — fixed UNet wiring (concat channels) + clean decoder order
+# models.py — ResUNet-1D generator + self-attention + 3-scale critic + surrogate detector
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -52,11 +52,31 @@ class DownBlock(nn.Module):
         x = self.down(x)
         return self.res(x)
 
+# ----------------- Self-Attention 1D -----------------
+class SelfAttention1D(nn.Module):
+    def __init__(self, in_dim):
+        super().__init__()
+        self.query = nn.Conv1d(in_dim, max(1, in_dim // 8), 1)
+        self.key   = nn.Conv1d(in_dim, max(1, in_dim // 8), 1)
+        self.value = nn.Conv1d(in_dim, in_dim, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        # x: [B, C, T]
+        B, C, T = x.shape
+        q = self.query(x).view(B, -1, T)       # [B, Cq, T]
+        k = self.key(x).view(B, -1, T)
+        v = self.value(x).view(B, -1, T)
+        attn = torch.bmm(q.transpose(1,2), k)  # [B, T, T]
+        attn = torch.softmax(attn / (q.size(1) ** 0.5), dim=-1)
+        out = torch.bmm(v, attn.transpose(1,2)).view(B, C, T)
+        return self.gamma * out + x
+
 # ----------------- Generator (ResUNet-1D) -----------------
 class Generator(nn.Module):
     """
     Input: waveform [B, T]
-    Output: waveform [B, T] (residual enhancement-style: out = in + delta)
+    Output: waveform [B, T] (residual enhancement-style: out = in + 0.5*delta)
     """
     def __init__(self, base=64, depth=4):
         super().__init__()
@@ -76,11 +96,13 @@ class Generator(nn.Module):
         self.bot = nn.Sequential(
             ResBlock1D(ch, k=3, dilation=1),
             ResBlock1D(ch, k=3, dilation=3),
+            SelfAttention1D(ch),
             ResBlock1D(ch, k=3, dilation=9),
         )
 
-        # decoder: expect concat (ch + ch_skip) => 2*ch in
+        # decoder: we will concat skip features
         for _ in range(depth):
+            # after concat channels double -> ups expect in_ch = current_ch * 2
             ups.append(UpBlock(in_ch=ch * 2, out_ch=ch // 2))
             ch //= 2
         self.ups = nn.ModuleList(ups)
@@ -111,7 +133,7 @@ class Generator(nn.Module):
         delta = self.outp(x).squeeze(1)
         return (wav + 0.5 * delta).clamp(-1, 1)
 
-# ----------------- Multi-Scale Discriminator -----------------
+# ----------------- Multi-Scale Discriminator (3-scale) -----------------
 class Critic1D(nn.Module):
     def __init__(self, in_ch=1, base=32):
         super().__init__()
@@ -147,14 +169,16 @@ class MultiScaleCritic(nn.Module):
         super().__init__()
         self.d1 = Critic1D(base=32)
         self.d2 = Critic1D(base=32)
+        self.d3 = Critic1D(base=32)
         self.avgpool = nn.AvgPool1d(4, 2, 1)
 
     def forward(self, x):
         s1 = x
         s2 = self.avgpool(x)
+        s3 = self.avgpool(self.avgpool(x))
         s = []
         f = []
-        for d, inp in [(self.d1, s1), (self.d2, s2)]:
+        for d, inp in [(self.d1, s1), (self.d2, s2), (self.d3, s3)]:
             sc, feats = d(inp)
             s.append(sc)
             f.append(feats)
@@ -163,7 +187,7 @@ class MultiScaleCritic(nn.Module):
 
 # ----------------- Optional Surrogate Detector -----------------
 class SurrogateDetector(nn.Module):
-    def __init__(self, mel_bins=128, hidden=512):
+    def __init__(self, mel_bins=160, hidden=1024):
         super().__init__()
         in_dim = mel_bins * 2  # mean + std pooling
         self.net = nn.Sequential(
