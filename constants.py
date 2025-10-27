@@ -86,7 +86,6 @@ SURROGATE_LR = 2e-4
 SURROGATE_BETA1 = 0.9
 SURROGATE_BETA2 = 0.999
 SURROGATE_W = 1.0  # weight inside evasion term
-SURROGATE_UPDATE_EVERY = 5  # how often to update surrogate (global steps)
 
 # Early stop target (ASV bona_fide probability)
 TARGET_P_BONA = 0.80
@@ -102,3 +101,10 @@ ASV_MODEL_PATH = ROOT / "ASVmodel" / "best_model.keras"
 ASV_SCALER_PATH = ROOT / "ASVmodel" / "scaler.pkl"
 ASV_TMP_DIR = SAVE_DIR / "_tmp_asv"
 ASV_TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+LOG_WITH_KERAS = False        # True = folosește Keras la logging (lent!)
+ALLREDUCE_EVERY_STEPS = 50    # nu mai facem allreduce la fiecare iterație
+
+# ---- Surrogate / Keras target ----
+SURROGATE_UPDATE_EVERY = 50   # mai rar; reduce încărcarea CPU/FS
+SURROGATE_MAX_SAMPLES = 2 
