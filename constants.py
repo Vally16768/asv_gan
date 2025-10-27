@@ -26,7 +26,7 @@ SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ----------------- Training -----------------
 AMP_ENABLED = True            # mixed precision for speed/stability
-BATCH_SIZE = 6
+BATCH_SIZE = 4
 EPOCHS = 1000                 # high cap; early stopping will typically stop earlier
 
 # TTUR (Two Time-scale) — D slightly faster than G

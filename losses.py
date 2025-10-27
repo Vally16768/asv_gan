@@ -1,4 +1,3 @@
-
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -7,22 +6,19 @@ import torchaudio
 
 # ----------------- GAN losses (WGAN) -----------------
 def d_loss_wgan(real_scores, fake_scores):
-    # maximize real - fake -> minimize fake - real
     return (fake_scores - real_scores).mean()
 
 def g_loss_wgan(fake_scores):
     return (-fake_scores).mean()
 
-# R1 penalty on real
 def r1_penalty(real_wave, real_scores):
-    # real_wave: [B,1,T] requires grad, real_scores: [B]
     grad = torch.autograd.grad(
         outputs=real_scores.sum(),
         inputs=real_wave,
         create_graph=True,
         retain_graph=True,
         only_inputs=True
-    )[0]  # [B,1,T]
+    )[0]
     penalty = grad.pow(2).reshape(grad.size(0), -1).sum(dim=1).mean()
     return penalty
 
@@ -44,7 +40,7 @@ class MRSTFTLoss(nn.Module):
         mag = torch.abs(X)
         return mag
 
-    def forward(self, x, y):  # wave [B,T]
+    def forward(self, x, y):
         loss = 0.0
         for n_fft, hop, win in zip(self.fft_sizes, self.hops, self.wins):
             X = self.stft_mag(x, n_fft, hop, win)
@@ -54,18 +50,17 @@ class MRSTFTLoss(nn.Module):
 
 # ----------------- Feature Matching -----------------
 def feature_matching_loss(real_feats, fake_feats):
-    # real_feats / fake_feats: list[list[tensors]] per scale
     tot = 0.0
     count = 0
     for rf_s, ff_s in zip(real_feats, fake_feats):
         for r, f in zip(rf_s, ff_s):
+            r = r.detach()  # asigură 0-grad pe ramura real (evită orice retenție accidentală)
             tot += F.l1_loss(r, f)
             count += 1
     return tot / max(1, count)
 
 # ----------------- Evasion Loss (with surrogate) -----------------
 def evasion_loss_from_logits(bona_logits, weight=1.0):
-    # We want bona_fide, so maximize sigmoid(logits) => minimize BCE with target 1
     target = torch.ones_like(bona_logits)
     loss = F.binary_cross_entropy_with_logits(bona_logits, target)
     return weight * loss

@@ -93,10 +93,8 @@ def main_worker(rank: int, world_size: int):
     os.makedirs(SAMPLES_DIR, exist_ok=True)
 
     # ----------------- Data + sampler (FIXED ROOTS) -----------------
-    # ASVBonafideDataset se așteaptă la o listă de patterns/paths care duc la fișiere.
-    # Îi dăm glob-uri recursive pentru mai multe extensii, ca să nu pice dacă nu ai .flac.
     roots = build_roots_patterns()
-    train_ds = ASVBonafideDataset(roots=roots)
+    train_ds = ASVBonafideDataset(roots=roots)  # :contentReference[oaicite:0]{index=0}
 
     sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank,
                                  shuffle=True, drop_last=True) if world_size > 1 else None
@@ -107,15 +105,15 @@ def main_worker(rank: int, world_size: int):
     )
 
     # Models
-    G = Generator().to(device)
-    D = MultiScaleCritic().to(device)
-    mel_feat = LogMel().to(device)
-    mrstft = MRSTFTLoss().to(device)
+    G = Generator().to(device)                     # :contentReference[oaicite:1]{index=1}
+    D = MultiScaleCritic().to(device)              # :contentReference[oaicite:2]{index=2}
+    mel_feat = LogMel().to(device)                 # :contentReference[oaicite:3]{index=3}
+    mrstft = MRSTFTLoss().to(device)               # :contentReference[oaicite:4]{index=4}
     ema = EMA(G, decay=EMA_DECAY) if (USE_EMA and is_main(rank)) else None
 
     # Surrogate + Keras detector (TF/CPU via wrapper)
-    surrogate = SurrogateDetector(mel_bins=mel_feat.mel.n_mels, hidden=2048).to(device) if USE_SURROGATE else None
-    detwrap = DetectorWrapper()  # Keras ASV (CPU)
+    surrogate = SurrogateDetector(mel_bins=mel_feat.mel.n_mels, hidden=2048).to(device) if USE_SURROGATE else None  # :contentReference[oaicite:5]{index=5}
+    detwrap = DetectorWrapper()  # Keras ASV (CPU) :contentReference[oaicite:6]{index=6}
 
     # DDP wrap
     if world_size > 1:
@@ -180,14 +178,14 @@ def main_worker(rank: int, world_size: int):
 
                     sr, fr = D(xr)
                     sf, ff = D(xf)
-                    lossD = d_loss_wgan(sr, sf)
+                    lossD = d_loss_wgan(sr, sf)  # :contentReference[oaicite:7]{index=7}
 
                 # lazy R1 în FP32
                 r1 = torch.tensor(0.0, device=device)
                 if (global_step % R1_EVERY) == 0:
                     xr_fp32 = x.unsqueeze(1).detach().requires_grad_(True)
                     sr_r1, _ = D(xr_fp32)  # FP32
-                    r1_val = r1_penalty(xr_fp32, sr_r1).clamp(max=1e3)
+                    r1_val = r1_penalty(xr_fp32, sr_r1).clamp(max=1e3)  # :contentReference[oaicite:8]{index=8}
                     r1 = r1_val
 
                 lossD_total = lossD + LAMBDA_R1 * r1
@@ -201,16 +199,17 @@ def main_worker(rank: int, world_size: int):
             with autocast(device_type='cuda', enabled=AMP_ENABLED):
                 xf = y.unsqueeze(1)
                 sr_fake, ff_fake = D(xf)
-                lossG_gan = g_loss_wgan(sr_fake) * LAMBDA_GAN
+                lossG_gan = g_loss_wgan(sr_fake) * LAMBDA_GAN      # :contentReference[oaicite:9]{index=9}
 
-                loss_mrstft = MRSTFTLoss().to(device)(y, x)  # mică alocare locală sigură
+                # ***** FIX OOM: RE-USE mrstft INSTANCE INSTEAD OF RE-CREATING IT *****
+                loss_mrstft = mrstft(y, x)                        # :contentReference[oaicite:10]{index=10}
                 mel_x = mel_feat(x)
                 mel_y = mel_feat(y)
                 loss_mel = torch.nn.functional.l1_loss(safe(mel_y), safe(mel_x))
 
                 with torch.no_grad():
                     sr_real, ff_real = D(x.unsqueeze(1))
-                loss_fm = feature_matching_loss(ff_real, ff_fake) * LAMBDA_FM
+                loss_fm = feature_matching_loss(ff_real, ff_fake) * LAMBDA_FM  # :contentReference[oaicite:11]{index=11}
                 loss_spec = (loss_mrstft + loss_mel) * LAMBDA_SPEC
 
                 # schedule evasion
@@ -223,7 +222,7 @@ def main_worker(rank: int, world_size: int):
                 loss_evasion = torch.tensor(0.0, device=device)
                 if (surrogate is not None) and (lambda_evasion > 0):
                     logits_bona = surrogate(mel_y)
-                    loss_evasion = evasion_loss_from_logits(logits_bona, weight=SURROGATE_W) * lambda_evasion
+                    loss_evasion = evasion_loss_from_logits(logits_bona, weight=SURROGATE_W) * lambda_evasion  # :contentReference[oaicite:12]{index=12}
 
                 lossG_total = lossG_gan + loss_spec + loss_fm + loss_evasion
 
@@ -238,12 +237,12 @@ def main_worker(rank: int, world_size: int):
             if ema is not None:
                 ema.update(G.module if hasattr(G, "module") else G)
 
-            # -------- Surrogate training (periodic, target = Keras prob bona_fide)
+            # -------- Surrogate training
             if (surrogate is not None) and (global_step % SURROGATE_UPDATE_EVERY == 0):
                 with torch.no_grad():
                     mel_y_det = mel_feat(y.detach())
                 try:
-                    keras_np = detwrap.keras_prob(y.detach().cpu())
+                    keras_np = detwrap.keras_prob(y.detach().cpu())    # :contentReference[oaicite:13]{index=13}
                     keras_t = torch.from_numpy(keras_np).float().to(device)
                     optS.zero_grad(set_to_none=True)
                     logits = surrogate(mel_y_det)
