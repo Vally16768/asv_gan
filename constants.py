@@ -3,7 +3,7 @@ from pathlib import Path
 
 # ----------------- Audio / Features -----------------
 SR = 16000
-MAX_AUDIO_SECONDS = 4
+MAX_AUDIO_SECONDS = 2
 SEGMENT_SAMPLES   = MAX_AUDIO_SECONDS * SR
 
 N_MELS = 160

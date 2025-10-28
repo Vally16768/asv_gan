@@ -11,6 +11,16 @@ from constants import ASV_COMBO, ASV_SCALER_PATH, ASV_TMP_DIR, SR
 from features import LogMel
 from detector_keras import KerasASV
 from asv_adapter import build_keras_input_vector
+# detector_wrapper.py  — adaugă imediat sus, înainte de `import tensorflow as tf`
+import os
+
+# Forțează TF pe CPU, ca să nu mai încerce să-și înregistreze cuDNN/cuBLAS pe GPU
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")            # suprimă INFO/WARN
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+
+import tensorflow as tf
 
 
 class DetectorWrapper:

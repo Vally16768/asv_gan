@@ -60,6 +60,26 @@ def norm_wave_per_sample(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     xn = (x - mean) / std
     return xn.clamp(-3.0, 3.0)  # ținem valori rezonabile înainte de D/G
 
+# ---------- (NEW) helpers pentru salvare audio audibilă ----------
+@torch.no_grad()
+def _rms_per_sample(w: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    # w: [B,T]
+    return (w.float().pow(2).mean(dim=1, keepdim=True) + eps).sqrt()
+
+@torch.no_grad()
+def match_rms_for_saving(y: torch.Tensor, x_ref: torch.Tensor) -> torch.Tensor:
+    """
+    Scalează doar pentru salvare: potrivește RMS-ul lui y cu cel al lui x_ref.
+    Nu influențează antrenarea. Clamps pentru a evita boost excesiv.
+    """
+    if y.ndim == 1: y = y.unsqueeze(0)
+    if x_ref.ndim == 1: x_ref = x_ref.unsqueeze(0)
+    ry = _rms_per_sample(y)
+    rx = _rms_per_sample(x_ref)
+    scale = (rx / ry.clamp(min=1e-6)).clamp(0.25, 8.0)  # limităm între -12 dB și +18 dB
+    y_scaled = (y * scale).clamp(-1.0, 1.0)
+    return y_scaled
+
 # ---------- seeding ----------
 def seed_all(s: int):
     import numpy as _np
@@ -86,7 +106,7 @@ class EMA:
     @torch.no_grad()
     def update(self, model: nn.Module):
         for k, v in model.state_dict().items():
-            self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
+            self.shadow[k].mul_((self.decay)).add_(v.detach(), alpha=1.0 - self.decay)
 
 
 def ddp_state_dict(m: nn.Module):
@@ -105,7 +125,6 @@ def broadcast_bool(flag: bool, device, world_size: int) -> bool:
         dist.broadcast(t, src=0)
     return bool(int(t.item()))
 
-
 def broadcast_tensor(t: torch.Tensor, world_size: int) -> torch.Tensor:
     if world_size > 1:
         dist.broadcast(t, src=0)
@@ -122,7 +141,14 @@ def main():
     os.environ.setdefault("NCCL_PROTO", "SIMPLE")
     os.environ.setdefault("OMP_NUM_THREADS", "1")
 
-    ngpus = torch.cuda.device_count()
+    # (NEW) modul debug single-GPU pentru localizare rapidă a kernelurilor care dau OOB
+    debug_single = os.environ.get("DEBUG_SINGLE_GPU", "")
+    ngpus_hw = torch.cuda.device_count()
+    if debug_single == "1":
+        ngpus = 1
+    else:
+        ngpus = ngpus_hw
+
     if ngpus > 1:
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", "29500")
@@ -223,6 +249,12 @@ def main_worker(rank: int, world_size: int):
             x = norm_wave_per_sample(x)                         # *** stabilizare critică ***
             x = safe_tensor(x)
 
+            # Gardă ieftină: dimensiuni corecte
+            B_cur, T_cur = x.shape
+            assert B_cur == BATCH_SIZE, f"BATCH_SIZE mismatch: got {B_cur}, expected {BATCH_SIZE}"
+            # Dacă pad_collate aliniază la multiplu de 256 (vezi dataset.py)
+            assert (T_cur % 256) == 0, f"Time length {T_cur} not aligned to 256 hop; check pad_collate."
+
             # ----- MIXUP SINCRONIZAT -----
             want_mix = data_rnd.random() < 0.3
             want_mix = broadcast_bool(want_mix, device, world_size)
@@ -233,9 +265,14 @@ def main_worker(rank: int, world_size: int):
                 else:
                     perm = torch.empty(x.size(0), device=device, dtype=torch.long)
                 perm = broadcast_tensor(perm, world_size)
+                # gardă defensivă
+                if x.size(0) > 0:
+                    assert perm.min().item() >= 0 and perm.max().item() < x.size(0), "perm out of range"
                 x = 0.7 * x + 0.3 * x[perm]
                 x = norm_wave_per_sample(x)                     # re-norm după mixup
                 x = safe_tensor(x)
+                # revalidare
+                assert (x.shape[1] % 256) == 0, "Time length lost alignment after mixup; check collate or mixup."
 
             # ----- forward G (tanh pentru a menține [-1,1])
             with autocast(device_type=('cuda' if device.type == 'cuda' else 'cpu'), enabled=AMP_ENABLED):
@@ -243,39 +280,42 @@ def main_worker(rank: int, world_size: int):
                 y = torch.tanh(y_raw)                           # *** principal anti-NaN ***
                 y = safe_tensor(y)
 
-            # ----- D train (WGAN + lazy R1)
+            # (NEW) asigurăm dtypes/contiguity pentru drumurile spre D/surrogate
+            x_f32 = x.float().contiguous()
+            y_f32 = y.float().contiguous()
+
+            # ----- D train (WGAN + lazy R1) — (NEW) FP32 ONLY
             for _ in range(CRITIC_ITERS):
                 optD.zero_grad(set_to_none=True)
-                with autocast(device_type=('cuda' if device.type == 'cuda' else 'cpu'), enabled=AMP_ENABLED):
-                    xr = x.unsqueeze(1)
-                    xf = y.detach().unsqueeze(1)
-                    if inst_noise > 0.0:
-                        xr = (xr + torch.randn_like(xr) * inst_noise).clamp(-1, 1)
-                        xf = (xf + torch.randn_like(xf) * inst_noise).clamp(-1, 1)
-                    # safe
-                    xr = safe_tensor(xr); xf = safe_tensor(xf)
-                    sr, fr = D(xr)
-                    sf, ff = D(xf)
-                    lossD = d_loss_wgan(sr, sf)
+
+                # fără autocast în D: evită hard-assert în cuDNN kernels cu fp16
+                xr = x_f32.unsqueeze(1)                         # [B,1,T], fp32, contiguous
+                xf = y_f32.detach().unsqueeze(1)               # [B,1,T], fp32, contiguous
+                if inst_noise > 0.0:
+                    xr = (xr + torch.randn_like(xr) * inst_noise).clamp(-1, 1)
+                    xf = (xf + torch.randn_like(xf) * inst_noise).clamp(-1, 1)
+                xr = safe_tensor(xr); xf = safe_tensor(xf)
+
+                sr, fr = D(xr)
+                sf, ff = D(xf)
+                lossD = d_loss_wgan(sr, sf)
 
                 # R1 doar periodic (fp32, fără autocast)
                 r1 = torch.tensor(0.0, device=device)
                 if (global_step % R1_EVERY) == 0:
-                    xr_fp32 = x.unsqueeze(1).detach().requires_grad_(True)
+                    xr_fp32 = x_f32.unsqueeze(1).detach().requires_grad_(True)
                     sr_r1, _ = D(xr_fp32)
                     r1 = r1_penalty(xr_fp32, sr_r1).clamp(max=1e3)
 
                 lossD_total = lossD + LAMBDA_R1 * r1
 
-                # protecție anti-NaN
                 if not isfinite_tensor(lossD_total):
-                    # micșorăm puțin bruiajul & delta și sărim pasul D
                     inst_noise = max(INST_NOISE_MIN, inst_noise * 0.99)
                     delta = max(DELTA_MIN, delta * 0.99)
                     continue
 
+                # (kept) scaler still enabled, even though fp32 — works fine
                 scalerD.scale(lossD_total).backward()
-                # grad clip
                 try:
                     scalerD.unscale_(optD)
                     torch.nn.utils.clip_grad_norm_(D.parameters(), GRAD_CLIP if GRAD_CLIP and GRAD_CLIP > 0 else 5.0)
@@ -285,36 +325,39 @@ def main_worker(rank: int, world_size: int):
 
             # ----- G train
             optG.zero_grad(set_to_none=True)
+            # (NEW) forward D in fp32 even inside G step
+            # Do spectral/feature in AMP, but cast y when sending to D
             with autocast(device_type=('cuda' if device.type == 'cuda' else 'cpu'), enabled=AMP_ENABLED):
-                sr_fake, ff_fake = D(y.unsqueeze(1))
-                lossG_gan = g_loss_wgan(sr_fake) * LAMBDA_GAN
-
                 # spectrale
                 loss_mrstft = mrstft(y, x)
                 mel_x = safe(mel_feat(x)); mel_y = safe(mel_feat(y))
                 loss_mel = torch.nn.functional.l1_loss(mel_y, mel_x)
-
-                # feature matching
-                with torch.no_grad():
-                    sr_real, ff_real = D(x.unsqueeze(1))
-                loss_fm = feature_matching_loss(ff_real, ff_fake) * LAMBDA_FM
                 loss_spec = (loss_mrstft + loss_mel) * LAMBDA_SPEC
 
-                # evasion schedule
-                if global_step < EVASION_WARMUP_STEPS:
-                    lambda_evasion = 0.0
-                else:
-                    t = min(1.0, (global_step - EVASION_WARMUP_STEPS) / max(1, EVASION_RAMP_STEPS))
-                    lambda_evasion = float(LAMBDA_EVASION_MAX * t)
+            # critic scores strictly fp32, outside autocast
+            sr_fake, ff_fake = D(y_f32.unsqueeze(1))
+            lossG_gan = g_loss_wgan(sr_fake) * LAMBDA_GAN
 
-                loss_evasion = torch.tensor(0.0, device=device)
-                if (surrogate is not None) and (lambda_evasion > 0):
-                    logits_bona = surrogate(mel_y)
-                    loss_evasion = evasion_loss_from_logits(logits_bona, weight=SURROGATE_W) * lambda_evasion
+            # feature matching (D fp32)
+            with torch.no_grad():
+                sr_real, ff_real = D(x_f32.unsqueeze(1))
+            loss_fm = feature_matching_loss(ff_real, ff_fake) * LAMBDA_FM
 
-                lossG_total = lossG_gan + loss_spec + loss_fm + loss_evasion
+            # evasion schedule
+            if global_step < EVASION_WARMUP_STEPS:
+                lambda_evasion = 0.0
+            else:
+                t = min(1.0, (global_step - EVASION_WARMUP_STEPS) / max(1, EVASION_RAMP_STEPS))
+                lambda_evasion = float(LAMBDA_EVASION_MAX * t)
 
-            # protecție anti-NaN
+            loss_evasion = torch.tensor(0.0, device=device)
+            if (surrogate is not None) and (lambda_evasion > 0):
+                # (NEW) ensure surrogate gets fp32
+                logits_bona = surrogate(mel_y.float())
+                loss_evasion = evasion_loss_from_logits(logits_bona, weight=SURROGATE_W) * lambda_evasion
+
+            lossG_total = lossG_gan + loss_spec + loss_fm + loss_evasion
+
             if not isfinite_tensor(lossG_total):
                 inst_noise = max(INST_NOISE_MIN, inst_noise * 0.99)
                 delta = max(DELTA_MIN, delta * 0.99)
@@ -335,7 +378,7 @@ def main_worker(rank: int, world_size: int):
             # ----- Surrogate update: DOAR rank-0 (rar)
             if is_main(rank) and (surrogate is not None) and (global_step % SURROGATE_UPDATE_EVERY == 0):
                 with torch.no_grad():
-                    mel_y_det = safe(mel_feat(y.detach()))
+                    mel_y_det = safe(mel_feat(y.detach())).float()
                 try:
                     if detwrap is not None and hasattr(detwrap, "keras_prob"):
                         keras_np = detwrap.keras_prob(y.detach().cpu())
@@ -364,12 +407,11 @@ def main_worker(rank: int, world_size: int):
                 else:
                     with torch.no_grad():
                         if surrogate is not None:
-                            logits = surrogate(safe(mel_feat(y.detach())))
+                            logits = surrogate(safe(mel_feat(y.detach())).float())
                             p_bona_mean = float(torch.sigmoid(logits).mean().item())
                         else:
                             p_bona_mean = 0.0
 
-                # toate valorile din log sunt finite
                 def fnum(v):
                     if isinstance(v, torch.Tensor):
                         v = float(v.detach().cpu().item())
@@ -415,7 +457,8 @@ def main_worker(rank: int, world_size: int):
         if is_main(rank):
             if SAVE_AUDIO_EVERY_EPOCH:
                 with torch.no_grad():
-                    save_wave(Path(SAMPLES_DIR) / f"ep{epoch:03d}_fake.wav", y[0].detach().cpu(), SR)
+                    y_save = match_rms_for_saving(y.detach().cpu(), x.detach().cpu())
+                    save_wave(Path(SAMPLES_DIR) / f"ep{epoch:03d}_fake.wav", y_save[0].detach().cpu(), SR)
                     save_wave(Path(SAMPLES_DIR) / f"ep{epoch:03d}_real.wav", x[0].detach().cpu(), SR)
             state = {"G": ddp_state_dict(G), "D": ddp_state_dict(D), "step": global_step, "epoch": epoch}
             if ema is not None:

@@ -111,3 +111,63 @@ def pad_collate(batch: List[Tuple[torch.Tensor, str]]):
         padded.append(w)
     x = torch.stack(padded, dim=0)  # [B, T]
     return x, list(paths)
+
+
+# dataset.py
+import torch
+import torch.nn.functional as F
+
+def pad_to_multiple(x: torch.Tensor, multiple: int) -> torch.Tensor:
+    """
+    x: [T] sau [B,T] -> pad la dreapta până la cel mai apropiat multiplu de `multiple`.
+    """
+    if x.ndim == 1:
+        T = x.size(0)
+        pad = (multiple - (T % multiple)) % multiple
+        return F.pad(x, (0, pad), mode="constant", value=0)
+    elif x.ndim == 2:
+        B, T = x.size()
+        pad = (multiple - (T % multiple)) % multiple
+        return F.pad(x, (0, pad), mode="constant", value=0)
+    else:
+        raise ValueError(f"pad_to_multiple expects [T] or [B,T], got {tuple(x.shape)}")
+
+def pad_collate(batch, hop_multiple: int = 256, max_clip_seconds: float | None = None, sr: int = 16000):
+    """
+    batch: list[(wave_1D_tensor, path_str)]
+    - taie la max_clip_seconds dacă e setat (centrat, fără indici negativi)
+    - pad la dreapta până la multiplu de hop_multiple
+    Return: x:[B,T], paths:list[str]
+    """
+    waves, paths = zip(*batch)
+    tens = []
+    for w in waves:
+        w = w.float().view(-1)  # [T]
+        if max_clip_seconds is not None:
+            max_len = int(max_clip_seconds * sr)
+            if w.numel() > max_len:
+                start = (w.numel() - max_len) // 2
+                end = start + max_len
+                # clamp sigur (fără indici negativi sau > len)
+                start = max(0, min(start, w.numel()))
+                end = max(0, min(end, w.numel()))
+                w = w[start:end].contiguous()
+        tens.append(w)
+
+    # găsește T_max și pad fiecare eșantion la multiplu de hop
+    T_max = max(t.numel() for t in tens)
+    # aliniem T_max la multiplu de hop_multiple
+    T_target = ((T_max + hop_multiple - 1) // hop_multiple) * hop_multiple
+
+    padded = []
+    for t in tens:
+        pad = T_target - t.numel()
+        if pad < 0:
+            # teoretic nu ar trebui; defensiv, tăiem la capăt
+            t = t[:T_target].contiguous()
+            pad = 0
+        t = F.pad(t, (0, pad), mode="constant", value=0)
+        padded.append(t)
+
+    x = torch.stack(padded, dim=0)  # [B, T_target]
+    return x, list(paths)
