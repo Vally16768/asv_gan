@@ -240,12 +240,15 @@ def main_worker(rank: int, world_size: int):
         pbar = tqdm(total=len(train_loader), disable=not is_main(rank),
                     desc=f"Epoch {epoch}/{EPOCHS}", ncols=100)
 
+        last_x_raw_for_save = None
+        last_y_for_save = None
         for it, (x, paths) in enumerate(train_loader):
             if want_stop:
                 break
 
             G.train(); D.train()
             x = x.to(device, non_blocking=True)                 # [B, T] waveform
+            x_raw_for_save = x.detach().cpu()                   # keep original (pre-normalization) for saving
             x = norm_wave_per_sample(x)                         # *** stabilizare critică ***
             x = safe_tensor(x)
 
@@ -276,13 +279,16 @@ def main_worker(rank: int, world_size: int):
 
             # ----- forward G (tanh pentru a menține [-1,1])
             with autocast(device_type=('cuda' if device.type == 'cuda' else 'cpu'), enabled=AMP_ENABLED):
-                y_raw = G(x)                                    # [B, T]
-                y = torch.tanh(y_raw)                           # *** principal anti-NaN ***
+                y = G(x)                                    # [B, T]  # generator already outputs in [-1,1]
                 y = safe_tensor(y)
 
             # (NEW) asigurăm dtypes/contiguity pentru drumurile spre D/surrogate
             x_f32 = x.float().contiguous()
             y_f32 = y.float().contiguous()
+
+            # remember last batch originals for epoch-end saving
+            last_x_raw_for_save = x_raw_for_save
+            last_y_for_save = y.detach().cpu()
 
             # ----- D train (WGAN + lazy R1) — (NEW) FP32 ONLY
             for _ in range(CRITIC_ITERS):
@@ -457,9 +463,10 @@ def main_worker(rank: int, world_size: int):
         if is_main(rank):
             if SAVE_AUDIO_EVERY_EPOCH:
                 with torch.no_grad():
-                    y_save = match_rms_for_saving(y.detach().cpu(), x.detach().cpu())
-                    save_wave(Path(SAMPLES_DIR) / f"ep{epoch:03d}_fake.wav", y_save[0].detach().cpu(), SR)
-                    save_wave(Path(SAMPLES_DIR) / f"ep{epoch:03d}_real.wav", x[0].detach().cpu(), SR)
+                    if last_x_raw_for_save is not None and last_y_for_save is not None:
+                        y_save = match_rms_for_saving(last_y_for_save, last_x_raw_for_save)
+                        save_wave(Path(SAMPLES_DIR) / f"ep{epoch:03d}_fake.wav", y_save[0], SR)
+                        save_wave(Path(SAMPLES_DIR) / f"ep{epoch:03d}_real.wav", last_x_raw_for_save[0], SR)
             state = {"G": ddp_state_dict(G), "D": ddp_state_dict(D), "step": global_step, "epoch": epoch}
             if ema is not None:
                 state["G_EMA"] = ema.shadow
