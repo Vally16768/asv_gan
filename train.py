@@ -60,7 +60,7 @@ def norm_wave_per_sample(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     xn = (x - mean) / std
     return xn.clamp(-3.0, 3.0)  # ținem valori rezonabile înainte de D/G
 
-# ---------- (NEW) helpers pentru salvare audio audibilă ----------
+# ---------- helpers pentru salvare audio audibilă ----------
 @torch.no_grad()
 def _rms_per_sample(w: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     # w: [B,T]
@@ -76,7 +76,8 @@ def match_rms_for_saving(y: torch.Tensor, x_ref: torch.Tensor) -> torch.Tensor:
     if x_ref.ndim == 1: x_ref = x_ref.unsqueeze(0)
     ry = _rms_per_sample(y)
     rx = _rms_per_sample(x_ref)
-    scale = (rx / ry.clamp(min=1e-6)).clamp(0.25, 8.0)  # limităm între -12 dB și +18 dB
+    # *** MODIFICAT: plafon 64× pentru debugging audio ***
+    scale = (rx / ry.clamp(min=1e-6)).clamp(0.25, 64.0)
     y_scaled = (y * scale).clamp(-1.0, 1.0)
     return y_scaled
 
@@ -141,7 +142,7 @@ def main():
     os.environ.setdefault("NCCL_PROTO", "SIMPLE")
     os.environ.setdefault("OMP_NUM_THREADS", "1")
 
-    # (NEW) modul debug single-GPU pentru localizare rapidă a kernelurilor care dau OOB
+    # modul debug single-GPU pentru localizare rapidă a kernelurilor care dau OOB
     debug_single = os.environ.get("DEBUG_SINGLE_GPU", "")
     ngpus_hw = torch.cuda.device_count()
     if debug_single == "1":
@@ -279,7 +280,7 @@ def main_worker(rank: int, world_size: int):
 
             # ----- forward G (tanh pentru a menține [-1,1])
             with autocast(device_type=('cuda' if device.type == 'cuda' else 'cpu'), enabled=AMP_ENABLED):
-                y = G(x)                                    # [B, T]  # generator already outputs in [-1,1]
+                y = G(x)                                    # [B, T]
                 y = safe_tensor(y)
 
             # (NEW) asigurăm dtypes/contiguity pentru drumurile spre D/surrogate
@@ -290,11 +291,10 @@ def main_worker(rank: int, world_size: int):
             last_x_raw_for_save = x_raw_for_save
             last_y_for_save = y.detach().cpu()
 
-            # ----- D train (WGAN + lazy R1) — (NEW) FP32 ONLY
+            # ----- D train (WGAN + lazy R1) — FP32 ONLY
             for _ in range(CRITIC_ITERS):
                 optD.zero_grad(set_to_none=True)
 
-                # fără autocast în D: evită hard-assert în cuDNN kernels cu fp16
                 xr = x_f32.unsqueeze(1)                         # [B,1,T], fp32, contiguous
                 xf = y_f32.detach().unsqueeze(1)               # [B,1,T], fp32, contiguous
                 if inst_noise > 0.0:
@@ -306,7 +306,7 @@ def main_worker(rank: int, world_size: int):
                 sf, ff = D(xf)
                 lossD = d_loss_wgan(sr, sf)
 
-                # R1 doar periodic (fp32, fără autocast)
+                # R1 doar periodic (fp32)
                 r1 = torch.tensor(0.0, device=device)
                 if (global_step % R1_EVERY) == 0:
                     xr_fp32 = x_f32.unsqueeze(1).detach().requires_grad_(True)
@@ -320,7 +320,6 @@ def main_worker(rank: int, world_size: int):
                     delta = max(DELTA_MIN, delta * 0.99)
                     continue
 
-                # (kept) scaler still enabled, even though fp32 — works fine
                 scalerD.scale(lossD_total).backward()
                 try:
                     scalerD.unscale_(optD)
@@ -331,8 +330,6 @@ def main_worker(rank: int, world_size: int):
 
             # ----- G train
             optG.zero_grad(set_to_none=True)
-            # (NEW) forward D in fp32 even inside G step
-            # Do spectral/feature in AMP, but cast y when sending to D
             with autocast(device_type=('cuda' if device.type == 'cuda' else 'cpu'), enabled=AMP_ENABLED):
                 # spectrale
                 loss_mrstft = mrstft(y, x)
@@ -358,7 +355,6 @@ def main_worker(rank: int, world_size: int):
 
             loss_evasion = torch.tensor(0.0, device=device)
             if (surrogate is not None) and (lambda_evasion > 0):
-                # (NEW) ensure surrogate gets fp32
                 logits_bona = surrogate(mel_y.float())
                 loss_evasion = evasion_loss_from_logits(logits_bona, weight=SURROGATE_W) * lambda_evasion
 
@@ -464,6 +460,10 @@ def main_worker(rank: int, world_size: int):
             if SAVE_AUDIO_EVERY_EPOCH:
                 with torch.no_grad():
                     if last_x_raw_for_save is not None and last_y_for_save is not None:
+                        # *** LOG RMS înainte de match pentru vizibilitate ***
+                        ry = float(_rms_per_sample(last_y_for_save).mean().item())
+                        rx = float(_rms_per_sample(last_x_raw_for_save).mean().item())
+                        print(f"[save] RMS in={rx:.6f} out={ry:.6f}")
                         y_save = match_rms_for_saving(last_y_for_save, last_x_raw_for_save)
                         save_wave(Path(SAMPLES_DIR) / f"ep{epoch:03d}_fake.wav", y_save[0], SR)
                         save_wave(Path(SAMPLES_DIR) / f"ep{epoch:03d}_real.wav", last_x_raw_for_save[0], SR)
