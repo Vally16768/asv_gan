@@ -3,3 +3,5 @@ __pycache__/
 
 runs/checkpoints/*
 train.log
+runs/checkpoints/
+train.log
